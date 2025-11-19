@@ -9,10 +9,7 @@ use ra_ap_project_model::{CargoConfig, ProjectManifest, RustLibSource};
 use ra_ap_syntax::Edition;
 use ra_ap_vfs::{Vfs, VfsPath};
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::PathBuf;
-use std::sync::mpsc::channel;
-use std::time::Duration;
+use std::{fs, path::PathBuf, sync::mpsc::channel, time::Duration};
 
 /// Forgen - Enhanced compile-time macro information with type awareness
 #[derive(Parser, Debug)]
@@ -312,42 +309,41 @@ fn extract_module_items(
     for def in module.declarations(db) {
         match def {
             ModuleDef::Function(func) => {
-                let name = func.name(db).display(db, edition).to_string();
-                let params = func
-                    .params_without_self(db)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(idx, param)| {
-                        let ty = param.ty();
-                        (
-                            format!("param_{}", idx),
-                            ty.display(db, edition).to_string(),
-                        )
-                    })
-                    .collect();
-                let return_type = func.ret_type(db).display(db, edition).to_string();
-
                 items.push(ItemInfo::Function {
-                    name,
-                    params,
-                    return_type,
+                    name: func.name(db).display(db, edition).to_string(),
+                    params: func
+                        .params_without_self(db)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, param)| {
+                            (
+                                param
+                                    .name(db)
+                                    .map(|name| name.display(db, edition).to_string())
+                                    .unwrap_or_else(|| idx.to_string()),
+                                param.ty().display(db, edition).to_string(),
+                            )
+                        })
+                        .collect(),
+                    return_type: func.ret_type(db).display(db, edition).to_string(),
                 });
             },
 
             ModuleDef::Adt(adt) => match adt {
                 ra_ap_hir::Adt::Struct(struct_def) => {
-                    let name = struct_def.name(db).display(db, edition).to_string();
-                    let fields = struct_def
-                        .fields(db)
-                        .into_iter()
-                        .map(|field| {
-                            let field_name = field.name(db).display(db, edition).to_string();
-                            let field_ty = field.ty(db).display(db, edition).to_string();
-                            (field_name, field_ty)
-                        })
-                        .collect();
-
-                    items.push(ItemInfo::Struct { name, fields });
+                    items.push(ItemInfo::Struct {
+                        name: struct_def.name(db).display(db, edition).to_string(),
+                        fields: struct_def
+                            .fields(db)
+                            .into_iter()
+                            .map(|field| {
+                                (
+                                    field.name(db).display(db, edition).to_string(),
+                                    field.ty(db).display(db, edition).to_string(),
+                                )
+                            })
+                            .collect(),
+                    });
                 },
 
                 ra_ap_hir::Adt::Enum(enum_def) => {
@@ -355,22 +351,18 @@ fn extract_module_items(
                     let variants = enum_def
                         .variants(db)
                         .into_iter()
-                        .map(|variant| {
-                            let variant_name = variant.name(db).display(db, edition).to_string();
-                            let fields = variant
+                        .map(|variant| VariantInfo {
+                            name: variant.name(db).display(db, edition).to_string(),
+                            fields: variant
                                 .fields(db)
                                 .into_iter()
                                 .map(|field| {
-                                    let field_name =
-                                        field.name(db).display(db, edition).to_string();
-                                    let field_ty = field.ty(db).display(db, edition).to_string();
-                                    (field_name, field_ty)
+                                    (
+                                        field.name(db).display(db, edition).to_string(),
+                                        field.ty(db).display(db, edition).to_string(),
+                                    )
                                 })
-                                .collect();
-                            VariantInfo {
-                                name: variant_name,
-                                fields,
-                            }
+                                .collect(),
                         })
                         .collect();
 
@@ -383,56 +375,53 @@ fn extract_module_items(
             },
 
             ModuleDef::Trait(trait_def) => {
-                let name = trait_def.name(db).display(db, edition).to_string();
-                let trait_items = trait_def
-                    .items(db)
-                    .into_iter()
-                    .map(|item| match item {
-                        ra_ap_hir::AssocItem::Function(func) => {
-                            format!("fn {}", func.name(db).display(db, edition))
-                        },
-                        ra_ap_hir::AssocItem::TypeAlias(ty) => {
-                            format!("type {}", ty.name(db).display(db, edition))
-                        },
-                        ra_ap_hir::AssocItem::Const(c) => {
-                            format!(
-                                "const {}",
-                                c.name(db)
-                                    .map(|n| n.display(db, edition).to_string())
-                                    .unwrap_or_else(|| "_".to_string())
-                            )
-                        },
-                    })
-                    .collect();
-
                 items.push(ItemInfo::Trait {
-                    name,
-                    items: trait_items,
+                    name: trait_def.name(db).display(db, edition).to_string(),
+                    items: trait_def
+                        .items(db)
+                        .into_iter()
+                        .map(|item| match item {
+                            ra_ap_hir::AssocItem::Function(func) => {
+                                format!("fn {}", func.name(db).display(db, edition))
+                            },
+                            ra_ap_hir::AssocItem::TypeAlias(ty) => {
+                                format!("type {}", ty.name(db).display(db, edition))
+                            },
+                            ra_ap_hir::AssocItem::Const(c) => {
+                                format!(
+                                    "const {}",
+                                    c.name(db)
+                                        .map(|n| n.display(db, edition).to_string())
+                                        .unwrap_or_else(|| "_".to_string())
+                                )
+                            },
+                        })
+                        .collect(),
                 });
             },
 
             ModuleDef::TypeAlias(type_alias) => {
-                let name = type_alias.name(db).display(db, edition).to_string();
-                let target = type_alias.ty(db).display(db, edition).to_string();
-
-                items.push(ItemInfo::TypeAlias { name, target });
+                items.push(ItemInfo::TypeAlias {
+                    name: type_alias.name(db).display(db, edition).to_string(),
+                    target: type_alias.ty(db).display(db, edition).to_string(),
+                });
             },
 
             ModuleDef::Const(const_def) => {
-                let name = const_def
-                    .name(db)
-                    .map(|n| n.display(db, edition).to_string())
-                    .unwrap_or_else(|| "_".to_string());
-                let ty = const_def.ty(db).display(db, edition).to_string();
-
-                items.push(ItemInfo::Const { name, ty });
+                items.push(ItemInfo::Const {
+                    name: const_def
+                        .name(db)
+                        .map(|n| n.display(db, edition).to_string())
+                        .unwrap_or_else(|| "_".to_string()),
+                    ty: const_def.ty(db).display(db, edition).to_string(),
+                });
             },
 
             ModuleDef::Static(static_def) => {
-                let name = static_def.name(db).display(db, edition).to_string();
-                let ty = static_def.ty(db).display(db, edition).to_string();
-
-                items.push(ItemInfo::Static { name, ty });
+                items.push(ItemInfo::Static {
+                    name: static_def.name(db).display(db, edition).to_string(),
+                    ty: static_def.ty(db).display(db, edition).to_string(),
+                });
             },
 
             ModuleDef::Module(submodule) => {

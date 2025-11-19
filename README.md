@@ -11,6 +11,7 @@ Forgen is a tool that extracts detailed type information from Rust projects usin
 ✅ **Phase 1: Type Extraction** - Currently working!
 
 The analyzer can now successfully:
+
 - Load Rust projects and their dependencies
 - Extract type information for all language items:
   - Functions (with parameter and return types)
@@ -31,44 +32,9 @@ The analyzer can now successfully:
 ## Usage
 
 Analyze the test project:
+
 ```bash
-cargo run --release
-```
-
-Analyze a specific project:
-```bash
-cargo run --release path/to/Cargo.toml
-```
-
-## Example Output
-
-```
-📦 Crate: forgen_test
-
-📁 Module: <root>
-  📌 Const: PI: f64
-  📌 Const: MAX_USERS: u32
-  📝 Type alias: UserId = u64
-  📝 Type alias: Score = f32
-  
-  📦 Struct: User
-    • id: u64
-    • name: String
-    • score: f32
-    
-  🔀 Enum: Role
-    • Guest
-    • Member
-    • Admin
-      - 0: Admin
-      
-  🎭 Trait: Greet
-    • fn greet
-    
-  🔧 Function: add
-    • param 0: i32
-    • param 1: i32
-    → returns: i32
+cd test && ..\target\release\cargo-forgen.exe
 ```
 
 ## Next Steps
@@ -124,4 +90,3 @@ cargo run --release path/to/Cargo.toml
 ## License
 
 MIT
-
