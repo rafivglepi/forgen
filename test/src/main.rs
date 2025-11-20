@@ -65,4 +65,21 @@ fn main() {
         Role::Member => println!("Regular member"),
         Role::Admin(admin) => println!("Admin id: {}, level: {}", admin.id, admin.level),
     }
+
+    let numbers = vec![1, 2, 3, 4, 5];
+
+    let doubled: Vec<i32> = numbers.iter().map(|x| x * 2).collect();
+    println!("Doubled: {:?}", doubled);
+
+    let multiply = |a: i32, b: i32| -> i32 { a * b };
+    let product = multiply(6, 7);
+    println!("6 * 7 = {}", product);
+
+    let mut counter = 0;
+    let mut increment = || {
+        counter += 1;
+        counter
+    };
+    println!("Count: {}", increment());
+    println!("Count: {}", increment());
 }
