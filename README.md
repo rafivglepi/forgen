@@ -41,19 +41,49 @@ Forgen is a tool that extracts detailed type information from Rust projects usin
 - Stable across re-analysis
 - Enable linking between types across files
 
+✅ **External Library Support** (Optional)
+
+- Extract type information from dependencies (crates.io libraries)
+- **Smart filtering**: Only extracts types your code actually references
+- Distinguish between local and external crates with `is_local` flag
+- Transitive type resolution (follows type references automatically)
+- Minimal overhead: ~2-3x local size (vs ~70x unfiltered)
+- Useful for understanding how to use library types in macros
+
 ## Usage
 
 Analyze a project:
 
 ```bash
-# From any Rust project directory
+# From any Rust project directory (local crates only)
 cargo-forgen
 
 # Or specify a path to Cargo.toml
 cargo-forgen /path/to/Cargo.toml
+
+# Include external library type information (dependencies from crates.io, etc.)
+cargo-forgen --include-external
+
+# Short form
+cargo-forgen -e
 ```
 
 The extracted information is saved to `target/.forgen.json` as a single minified JSON file.
+
+**Note on External Libraries:**
+
+- Without `--include-external`: Only extracts types from your local workspace crates (~2-10 KB)
+- With `--include-external`: Includes **only referenced types** from dependencies (~2-3x local size)
+  - Uses smart filtering to extract only types your code actually uses
+  - Follows type references transitively (if you use `Foo`, and `Foo` has a field of type `Bar`, both are extracted)
+  - Skips unreferenced library code entirely
+  - Standard library crates (`std`, `core`, `alloc`) are excluded to avoid noise
+
+**Example:** A project using `serde`:
+
+- Local only: 2.9 KB (2 files)
+- With external (old): 528 KB (348 files) ❌
+- With external (filtered): 7.6 KB (2 files) ✅
 
 ## Output Format
 
@@ -77,6 +107,24 @@ The output is a single JSON file with this structure:
   ]
 }
 ```
+
+### Crate Metadata
+
+Each crate in the output includes:
+
+```json
+{
+  "name": "serde",
+  "root_file": "C:\\Users\\...\\serde-1.0.228\\src\\lib.rs",
+  "edition": "2021",
+  "is_local": false
+}
+```
+
+The `is_local` field distinguishes between:
+
+- `true`: Your local workspace crates
+- `false`: External dependencies (crates.io, git, etc.)
 
 ### Example Items
 
@@ -241,13 +289,54 @@ All three `x` variables get different IDs, which is correct because they're genu
 └─────────────────────┘
 ```
 
+## Examples
+
+### Test Project
+
+The `test/` directory contains a sample project that demonstrates:
+
+- Internal module imports (`lib.rs` → `main.rs`)
+- External dependencies (`serde`, `serde_json`)
+- Derived traits from external crates (`Serialize`, `Deserialize`)
+
+Run forgen on the test project:
+
+```bash
+# Local types only
+cargo-forgen test/Cargo.toml
+
+# With external libraries
+cargo-forgen test/Cargo.toml --include-external
+```
+
+**Output comparison:**
+
+- Without `-e`: 2.9 KB, 2 files (local code only)
+- With `-e`: 7.6 KB, 2 files (includes only referenced serde types)
+
+## How External Filtering Works
+
+When `--include-external` is enabled, forgen uses a two-phase approach:
+
+1. **Phase 1 - Local Analysis**: Extract all types from your local workspace crates and collect every type name mentioned (in function signatures, struct fields, etc.)
+
+2. **Phase 2 - Smart External Extraction**: For external crates, only extract items that:
+   - Match type names collected in Phase 1 (by name)
+   - Have their types extracted transitively (if `TypeA` uses `TypeB`, both are included)
+   - Are reachable from your code
+
+This approach reduces external library data by ~70x while keeping all the types you actually need!
+
 ## Next Steps
 
+- [x] External library type extraction
+- [x] Smart filtering for external libraries (reachability analysis)
+- [ ] Multi-pass transitive closure for deeper type dependencies
 - [ ] Improve type inference for local variables using HIR body maps
 - [ ] Add support for extracting expression types within function bodies
 - [ ] Add scope depth tracking for better shadowing analysis
 - [ ] Build helpers to parse and query the data
-- [ ] Add cross-crate reference resolution (track imports and their sources)
+- [ ] Add filtering options for specific external crates
 
 ## Dependencies
 

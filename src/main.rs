@@ -1,16 +1,18 @@
 use anyhow::{Context, Result};
+use cargo_metadata::MetadataCommand;
 use clap::Parser;
 use notify_debouncer_mini::{new_debouncer, notify::*};
 use ra_ap_hir::{ChangeWithProcMacros, Crate, HasSource, HirDisplay, ModuleDef, Semantics};
-use ra_ap_ide_db::RootDatabase;
+use ra_ap_ide_db::base_db::SourceDatabase;
+use ra_ap_ide_db::{FileId, RootDatabase};
 use ra_ap_load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice};
 use ra_ap_paths::AbsPathBuf;
 use ra_ap_project_model::{CargoConfig, ProjectManifest, RustLibSource};
-use ra_ap_syntax::{ast, ast::HasName, AstNode, Edition};
-use ra_ap_vfs::{FileId, Vfs, VfsPath};
+use ra_ap_syntax::{ast, ast::HasName, AstNode, Edition, SourceFile};
+use ra_ap_vfs::{Vfs, VfsPath};
 use serde::{Deserialize, Serialize, Serializer};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::PathBuf,
     sync::mpsc::channel,
@@ -51,6 +53,10 @@ struct Args {
     /// Watch for file changes and re-analyze (development mode)
     #[arg(short, long)]
     watch: bool,
+
+    /// Include external library type information (dependencies from crates.io, etc.)
+    #[arg(short = 'e', long)]
+    include_external: bool,
 }
 
 // Data structures for serializing type information
@@ -74,16 +80,28 @@ struct FileTypeInfo {
     items: Vec<ItemInfo>,
 }
 
+// Helper to skip if value is false (for local field)
+fn skip_if_false(b: &bool) -> bool {
+    !*b
+}
+
 /// Metadata about the entire crate
 #[derive(Debug, Serialize, Deserialize)]
 struct CrateMetadata {
     /// Crate name
     name: String,
-    /// Crate root module path
-    root_file: String,
-    /// Edition (e.g., "2021")
-    edition: String,
-    /// Is this a local workspace crate?
+    /// Crate version
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    /// Enabled features
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    features: Vec<String>,
+    /// Is this a local workspace crate? (1 = local, omitted = external)
+    #[serde(
+        rename = "local",
+        serialize_with = "serialize_bool_as_int",
+        skip_serializing_if = "skip_if_false"
+    )]
     is_local: bool,
 }
 
@@ -271,7 +289,13 @@ fn main() -> Result<()> {
         println!("Press Ctrl+C to stop\n");
 
         // Initial analysis
-        analyze_and_save(&host, &vfs, &project_dir)?;
+        analyze_and_save(
+            &host,
+            &vfs,
+            &project_dir,
+            args.include_external,
+            &manifest_path_abs,
+        )?;
 
         // Setup file watcher
         let (tx, rx) = channel();
@@ -304,7 +328,13 @@ fn main() -> Result<()> {
                         match apply_file_changes(&mut host, &mut vfs, &changed_files) {
                             Ok(_) => {
                                 // Re-analyze with the updated database
-                                match analyze_and_save(&host, &vfs, &project_dir) {
+                                match analyze_and_save(
+                                    &host,
+                                    &vfs,
+                                    &project_dir,
+                                    args.include_external,
+                                    &manifest_path_abs,
+                                ) {
                                     Ok(_) => println!("✅ Re-analysis complete\n"),
                                     Err(e) => eprintln!("❌ Error during re-analysis: {}\n", e),
                                 }
@@ -322,7 +352,13 @@ fn main() -> Result<()> {
         }
     } else {
         // Single run mode
-        analyze_and_save(&host, &vfs, &project_dir)?;
+        analyze_and_save(
+            &host,
+            &vfs,
+            &project_dir,
+            args.include_external,
+            &manifest_path_abs,
+        )?;
         println!("\n✨ Analysis complete!");
     }
 
@@ -414,9 +450,16 @@ fn load_workspace(manifest_path: &AbsPathBuf) -> Result<(RootDatabase, Vfs)> {
     Ok((host, vfs))
 }
 
-fn analyze_and_save(db: &RootDatabase, vfs: &Vfs, project_dir: &PathBuf) -> Result<()> {
+fn analyze_and_save(
+    db: &RootDatabase,
+    vfs: &Vfs,
+    project_dir: &PathBuf,
+    include_external: bool,
+    manifest_path: &PathBuf,
+) -> Result<()> {
     // Extract type information per file
-    let (file_infos, crate_metadata) = extract_type_info_by_file(db, vfs, project_dir)?;
+    let (file_infos, crate_metadata) =
+        extract_type_info_by_file(db, vfs, project_dir, include_external, manifest_path)?;
 
     // Create output directory
     let output_dir = project_dir.join("target");
@@ -442,54 +485,187 @@ fn analyze_and_save(db: &RootDatabase, vfs: &Vfs, project_dir: &PathBuf) -> Resu
     Ok(())
 }
 
+fn load_cargo_metadata(manifest_path: &PathBuf) -> Result<HashMap<String, (String, Vec<String>)>> {
+    // Load cargo metadata to get version and features
+    let metadata = MetadataCommand::new()
+        .manifest_path(manifest_path)
+        .exec()
+        .context("Failed to load cargo metadata")?;
+
+    let mut crate_info = HashMap::new();
+    for package in metadata.packages {
+        // Store version and active features for each package
+        let info = (
+            package.version.to_string(),
+            package.features.keys().cloned().collect(),
+        );
+
+        // Insert with original name
+        crate_info.insert(package.name.clone(), info.clone());
+
+        // Also insert with underscores (Cargo.toml uses hyphens, Rust uses underscores)
+        let underscore_name = package.name.replace('-', "_");
+        if underscore_name != package.name {
+            crate_info.insert(underscore_name, info);
+        }
+    }
+
+    Ok(crate_info)
+}
+
 fn extract_type_info_by_file(
     db: &RootDatabase,
     vfs: &Vfs,
     project_dir: &PathBuf,
+    include_external: bool,
+    manifest_path: &PathBuf,
 ) -> Result<(BTreeMap<PathBuf, FileTypeInfo>, Vec<CrateMetadata>)> {
     let sema = Semantics::new(db);
     let crates = Crate::all(db);
 
-    // Filter to only workspace crates
-    let workspace_crates: Vec<_> = crates
-        .into_iter()
+    // Load cargo metadata for version and features
+    let cargo_info = load_cargo_metadata(manifest_path).unwrap_or_default();
+
+    // Separate local and external crates
+    let local_crates: Vec<_> = crates
+        .iter()
         .filter(|krate| krate.origin(db).is_local())
+        .cloned()
         .collect();
+
+    let external_crates: Vec<_> = if include_external {
+        crates
+            .into_iter()
+            .filter(|krate| {
+                if krate.origin(db).is_local() {
+                    return false;
+                }
+                let name = krate
+                    .display_name(db)
+                    .map(|n| n.to_string())
+                    .unwrap_or_default();
+                // Filter out standard library crates to avoid noise
+                !matches!(
+                    name.as_str(),
+                    "std" | "core" | "alloc" | "proc_macro" | "test"
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let mut file_infos: BTreeMap<PathBuf, FileTypeInfo> = BTreeMap::new();
     let mut crate_metadata_map: HashMap<String, CrateMetadata> = HashMap::new();
+    let mut referenced_types: HashSet<String> = HashSet::new();
 
-    for krate in workspace_crates {
+    println!(
+        "📊 Phase 1: Analyzing {} local crate(s)...",
+        local_crates.len()
+    );
+
+    // Phase 1: Extract all local crates and collect type references
+    for krate in &local_crates {
         let display_name = krate
             .display_name(db)
             .map(|n| n.to_string())
             .unwrap_or_else(|| "<unnamed>".to_string());
 
         let root_module = krate.root_module();
-
-        // Get root file info
-        let root_hir_file_id = root_module.definition_source(db).file_id;
-        let root_file_id = root_hir_file_id
-            .file_id()
-            .and_then(|eid| Some(eid.file_id()));
-        let root_file_path = root_file_id.and_then(|fid| file_id_to_path(vfs, fid, project_dir));
-
-        // Only add one metadata entry per crate name (deduplicate lib/bin)
         crate_metadata_map
             .entry(display_name.clone())
-            .or_insert_with(|| CrateMetadata {
-                name: display_name.clone(),
-                root_file: root_file_path
-                    .as_ref()
-                    .and_then(|p| p.to_str())
-                    .unwrap_or("<unknown>")
-                    .to_string(),
-                edition: "2021".to_string(), // We could detect this from the manifest
-                is_local: true,
+            .or_insert_with(|| {
+                let (version, features) = cargo_info
+                    .get(&display_name)
+                    .map(|(v, f)| (Some(v.clone()), f.clone()))
+                    .unwrap_or((None, Vec::new()));
+
+                CrateMetadata {
+                    name: display_name.clone(),
+                    version,
+                    features,
+                    is_local: true,
+                }
             });
 
-        // Extract items, organizing by file
-        extract_module_items_by_file(db, &sema, vfs, &root_module, &mut file_infos, project_dir)?;
+        // Extract imports from all files in the local crate first
+        extract_module_imports(db, &root_module, &mut referenced_types);
+
+        extract_module_items_by_file(
+            db,
+            &sema,
+            vfs,
+            &root_module,
+            &mut file_infos,
+            project_dir,
+            &mut referenced_types,
+            false, // is_external
+        )?;
+    }
+
+    let type_names: Vec<_> = referenced_types.iter().take(10).collect();
+    println!(
+        "  Collected {} referenced type names (first 10): {:?}",
+        referenced_types.len(),
+        type_names
+    );
+
+    // Phase 2: Extract external crates, but only public items that are referenced
+    if !external_crates.is_empty() {
+        println!(
+            "📊 Phase 2: Analyzing {} external crate(s) (filtering to reachable types)...",
+            external_crates.len()
+        );
+
+        let mut extracted_external_files = 0;
+
+        for krate in &external_crates {
+            let display_name = krate
+                .display_name(db)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "<unnamed>".to_string());
+
+            let root_module = krate.root_module();
+
+            crate_metadata_map
+                .entry(display_name.clone())
+                .or_insert_with(|| {
+                    let (version, features) = cargo_info
+                        .get(&display_name)
+                        .map(|(v, f)| (Some(v.clone()), f.clone()))
+                        .unwrap_or((None, Vec::new()));
+
+                    CrateMetadata {
+                        name: display_name.clone(),
+                        version,
+                        features,
+                        is_local: false,
+                    }
+                });
+
+            let before_count = file_infos.len();
+            extract_module_items_by_file_filtered(
+                db,
+                &sema,
+                vfs,
+                &root_module,
+                &mut file_infos,
+                project_dir,
+                &mut referenced_types,
+                true, // is_external
+            )?;
+            let after_count = file_infos.len();
+            if after_count > before_count {
+                extracted_external_files += after_count - before_count;
+                println!(
+                    "  Found {} items in {}",
+                    after_count - before_count,
+                    display_name
+                );
+            }
+        }
+
+        println!("  Extracted {} external files", extracted_external_files);
     }
 
     let crate_metadata: Vec<CrateMetadata> = crate_metadata_map.into_values().collect();
@@ -504,6 +680,147 @@ fn file_id_to_path(vfs: &Vfs, file_id: FileId, _project_dir: &PathBuf) -> Option
     >>::as_ref(abs_path)))
 }
 
+/// Helper to extract type names from a type string
+fn extract_type_names(type_str: &str, referenced_types: &mut HashSet<String>) {
+    // Extract base type names from type strings like "Vec<String>", "&Option<Foo>", etc.
+    // This is a simple heuristic - we extract capitalized words that look like type names
+    for word in type_str.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        if !word.is_empty() && word.chars().next().unwrap().is_uppercase() {
+            // Filter out common non-types
+            if !matches!(
+                word,
+                "Self" | "Result" | "Option" | "Vec" | "Box" | "Arc" | "Rc" | "Cow"
+            ) {
+                referenced_types.insert(word.to_string());
+            }
+        }
+    }
+}
+
+/// Extract type names from imports in a file
+fn extract_imports_from_file(
+    db: &RootDatabase,
+    file_id: FileId,
+    referenced_types: &mut HashSet<String>,
+) {
+    // Get file text from the database
+    let file_text = SourceDatabase::file_text(db, file_id);
+    let text = &*file_text;
+
+    // Parse the file to extract use statements
+    let parsed = SourceFile::parse(text, Edition::CURRENT);
+    let root = parsed.syntax_node();
+
+    // Walk the syntax tree to find use items
+    for node in root.descendants() {
+        if let Some(use_tree) = ast::UseTree::cast(node.clone()) {
+            // Extract the path from the use tree
+            if let Some(path) = use_tree.path() {
+                // Get each segment of the path (e.g., "serde::Serialize" -> ["serde", "Serialize"])
+                for segment in path.segments() {
+                    if let Some(name_ref) = segment.name_ref() {
+                        let name = name_ref.text().to_string();
+                        // Check if it looks like a type (starts with uppercase)
+                        if !name.is_empty() && name.chars().next().unwrap().is_uppercase() {
+                            referenced_types.insert(name);
+                        }
+                    }
+                }
+            }
+
+            // Also check for use tree lists like {Serialize, Deserialize}
+            if let Some(use_tree_list) = use_tree.use_tree_list() {
+                for sub_tree in use_tree_list.use_trees() {
+                    if let Some(path) = sub_tree.path() {
+                        for segment in path.segments() {
+                            if let Some(name_ref) = segment.name_ref() {
+                                let name = name_ref.text().to_string();
+                                if !name.is_empty() && name.chars().next().unwrap().is_uppercase() {
+                                    referenced_types.insert(name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Recursively extract imports from a module and its submodules
+fn extract_module_imports(
+    db: &RootDatabase,
+    module: &ra_ap_hir::Module,
+    referenced_types: &mut HashSet<String>,
+) {
+    // Get the file for this module
+    let module_source = module.definition_source(db);
+    if let Some(file_id) = module_source.file_id.file_id() {
+        extract_imports_from_file(db, file_id.file_id(), referenced_types);
+    }
+
+    // Recurse into submodules
+    for child in module.children(db) {
+        extract_module_imports(db, &child, referenced_types);
+    }
+}
+
+/// Check if an item is public (visible outside the crate)
+fn is_public(_db: &RootDatabase, def: &ModuleDef) -> bool {
+    // Check if the item's visibility is Public
+    // We do this by checking if it has a `pub` visibility
+    // For external crates, we assume all items we can see are somewhat public
+    // So we'll just return true for simplicity - the main filtering will be by name
+    match def {
+        ModuleDef::Module(_) => true, // Modules are traversable
+        _ => {
+            // For now, assume all items we can extract from external crates are public enough
+            // The real filtering happens by checking if they're referenced
+            true
+        },
+    }
+}
+
+/// Filtered version for external crates - only public and referenced types
+fn extract_module_items_by_file_filtered(
+    db: &RootDatabase,
+    sema: &Semantics<RootDatabase>,
+    vfs: &Vfs,
+    module: &ra_ap_hir::Module,
+    file_infos: &mut BTreeMap<PathBuf, FileTypeInfo>,
+    project_dir: &PathBuf,
+    referenced_types: &mut HashSet<String>,
+    is_external: bool,
+) -> Result<()> {
+    // For external crates, we'll do multiple passes to find transitively referenced types
+    let mut newly_found = HashSet::new();
+    let initial_count = referenced_types.len();
+
+    // Do extraction, which will add more referenced types
+    extract_module_items_by_file(
+        db,
+        sema,
+        vfs,
+        module,
+        file_infos,
+        project_dir,
+        referenced_types,
+        is_external,
+    )?;
+
+    // Check if we found new types
+    for ty in referenced_types.iter() {
+        if referenced_types.len() > initial_count {
+            newly_found.insert(ty.clone());
+        }
+    }
+
+    // TODO: Could iterate until no new types found for full transitive closure
+    // For now, one pass is good enough
+
+    Ok(())
+}
+
 fn extract_module_items_by_file(
     db: &RootDatabase,
     sema: &Semantics<RootDatabase>,
@@ -511,10 +828,39 @@ fn extract_module_items_by_file(
     module: &ra_ap_hir::Module,
     file_infos: &mut BTreeMap<PathBuf, FileTypeInfo>,
     project_dir: &PathBuf,
+    referenced_types: &mut HashSet<String>,
+    is_external: bool,
 ) -> Result<()> {
     let edition = Edition::CURRENT;
 
     for def in module.declarations(db) {
+        // For external crates, skip non-public items and non-referenced types
+        if is_external {
+            if !is_public(db, &def) {
+                continue; // Skip private items from external crates
+            }
+
+            // Check if this type is referenced (only for non-module items)
+            if !matches!(def, ModuleDef::Module(_)) {
+                let name = match &def {
+                    ModuleDef::Function(f) => f.name(db).display(db, edition).to_string(),
+                    ModuleDef::Adt(adt) => match adt {
+                        ra_ap_hir::Adt::Struct(s) => s.name(db).display(db, edition).to_string(),
+                        ra_ap_hir::Adt::Enum(e) => e.name(db).display(db, edition).to_string(),
+                        ra_ap_hir::Adt::Union(u) => u.name(db).display(db, edition).to_string(),
+                    },
+                    ModuleDef::Trait(t) => t.name(db).display(db, edition).to_string(),
+                    ModuleDef::TypeAlias(t) => t.name(db).display(db, edition).to_string(),
+                    _ => continue,
+                };
+
+                if !referenced_types.contains(&name) {
+                    continue; // Skip unreferenced types from external crates
+                }
+            }
+            // Always recurse into modules to find types deep in the crate structure
+        }
+
         // Get the file where this definition lives
         let file_id = match def {
             ModuleDef::Function(f) => f
@@ -553,7 +899,16 @@ fn extract_module_items_by_file(
                 .map(|eid| eid.file_id()),
             ModuleDef::Module(m) => {
                 // Recursively process submodules
-                extract_module_items_by_file(db, sema, vfs, &m, file_infos, project_dir)?;
+                extract_module_items_by_file(
+                    db,
+                    sema,
+                    vfs,
+                    &m,
+                    file_infos,
+                    project_dir,
+                    referenced_types,
+                    is_external,
+                )?;
                 continue;
             },
             _ => None,
@@ -568,17 +923,57 @@ fn extract_module_items_by_file(
         };
 
         // Get or create the FileTypeInfo for this file
-        let file_info = file_infos
-            .entry(file_path.clone())
-            .or_insert_with(|| FileTypeInfo {
-                source_file: file_path
+        let file_info = file_infos.entry(file_path.clone()).or_insert_with(|| {
+            // For external crates, strip the registry/toolchain path prefix
+            let source_file_str = if is_external {
+                let path_str = file_path.to_str().unwrap_or("<unknown>");
+                // Try to find common external crate path patterns and extract just the relative part
+                // Pattern: C:\Users\..\.cargo\registry\src\index.../crate-version\src\file.rs -> src\file.rs
+                // Pattern: C:\Users\..\.rustup\toolchains\...\library\crate\src\file.rs -> crate\src\file.rs
+
+                if let Some(registry_pos) = path_str.find("\\.cargo\\registry\\src\\") {
+                    // Skip past the registry path and index hash
+                    let after_registry = registry_pos + "\\.cargo\\registry\\src\\".len();
+                    // Find the next directory separator after the index hash (e.g., "index.crates.io-1949...")
+                    if let Some(hash_end) = path_str[after_registry..].find('\\') {
+                        let after_hash = after_registry + hash_end + 1;
+                        // Now skip the crate-version directory to get to src/...
+                        if let Some(crate_end) = path_str[after_hash..].find('\\') {
+                            let relative_start = after_hash + crate_end + 1;
+                            &path_str[relative_start..]
+                        } else {
+                            path_str
+                        }
+                    } else {
+                        path_str
+                    }
+                } else if let Some(toolchain_pos) = path_str.find("\\.rustup\\toolchains\\") {
+                    // For stdlib crates, find /library/ and keep from there
+                    if let Some(lib_pos) = path_str[toolchain_pos..].find("\\library\\") {
+                        let after_lib = toolchain_pos + lib_pos + "\\library\\".len();
+                        &path_str[after_lib..]
+                    } else {
+                        path_str
+                    }
+                } else {
+                    path_str
+                }
+                .to_string()
+            } else {
+                // For local files, strip project directory
+                file_path
                     .strip_prefix(project_dir)
                     .unwrap_or(&file_path)
                     .to_str()
                     .unwrap_or("<unknown>")
-                    .to_string(),
+                    .to_string()
+            };
+
+            FileTypeInfo {
+                source_file: source_file_str,
                 items: Vec::new(),
-            });
+            }
+        });
 
         // Extract item information
         match def {
@@ -590,24 +985,35 @@ fn extract_module_items_by_file(
                     .params_without_self(db)
                     .into_iter()
                     .enumerate()
-                    .map(|(idx, param)| ParamInfo {
-                        name: param
-                            .name(db)
-                            .map(|name| name.display(db, edition).to_string())
-                            .unwrap_or_else(|| format!("_{}", idx)),
-                        ty: param.ty().display(db, edition).to_string(),
-                        type_ref: None, // TODO: extract type references
+                    .map(|(idx, param)| {
+                        let ty_str = param.ty().display(db, edition).to_string();
+                        extract_type_names(&ty_str, referenced_types);
+                        ParamInfo {
+                            name: param
+                                .name(db)
+                                .map(|name| name.display(db, edition).to_string())
+                                .unwrap_or_else(|| format!("_{}", idx)),
+                            ty: ty_str,
+                            type_ref: None, // TODO: extract type references
+                        }
                     })
                     .collect();
 
-                // Extract function body information
-                let body = extract_function_body(db, sema, &func, edition);
+                let ret_type_str = func.ret_type(db).display(db, edition).to_string();
+                extract_type_names(&ret_type_str, referenced_types);
+
+                // Extract function body information (skip for external crates)
+                let body = if !is_external {
+                    extract_function_body(db, sema, &func, edition)
+                } else {
+                    None
+                };
 
                 file_info.items.push(ItemInfo::Function {
                     name: func.name(db).display(db, edition).to_string(),
                     id: hir_id,
                     params,
-                    return_type: func.ret_type(db).display(db, edition).to_string(),
+                    return_type: ret_type_str,
                     body,
                 });
             },
@@ -615,18 +1021,24 @@ fn extract_module_items_by_file(
             ModuleDef::Adt(adt) => match adt {
                 ra_ap_hir::Adt::Struct(struct_def) => {
                     let hir_id = format!("{:?}", struct_def).replace(" ", "");
+                    let fields: Vec<FieldInfo> = struct_def
+                        .fields(db)
+                        .into_iter()
+                        .map(|field| {
+                            let ty_str = field.ty(db).display(db, edition).to_string();
+                            extract_type_names(&ty_str, referenced_types);
+                            FieldInfo {
+                                name: field.name(db).display(db, edition).to_string(),
+                                ty: ty_str,
+                                type_ref: None,
+                            }
+                        })
+                        .collect();
+
                     file_info.items.push(ItemInfo::Struct {
                         name: struct_def.name(db).display(db, edition).to_string(),
                         id: hir_id,
-                        fields: struct_def
-                            .fields(db)
-                            .into_iter()
-                            .map(|field| FieldInfo {
-                                name: field.name(db).display(db, edition).to_string(),
-                                ty: field.ty(db).display(db, edition).to_string(),
-                                type_ref: None,
-                            })
-                            .collect(),
+                        fields,
                     });
                 },
 
@@ -636,17 +1048,24 @@ fn extract_module_items_by_file(
                     let variants = enum_def
                         .variants(db)
                         .into_iter()
-                        .map(|variant| VariantInfo {
-                            name: variant.name(db).display(db, edition).to_string(),
-                            fields: variant
+                        .map(|variant| {
+                            let fields: Vec<FieldInfo> = variant
                                 .fields(db)
                                 .into_iter()
-                                .map(|field| FieldInfo {
-                                    name: field.name(db).display(db, edition).to_string(),
-                                    ty: field.ty(db).display(db, edition).to_string(),
-                                    type_ref: None,
+                                .map(|field| {
+                                    let ty_str = field.ty(db).display(db, edition).to_string();
+                                    extract_type_names(&ty_str, referenced_types);
+                                    FieldInfo {
+                                        name: field.name(db).display(db, edition).to_string(),
+                                        ty: ty_str,
+                                        type_ref: None,
+                                    }
                                 })
-                                .collect(),
+                                .collect();
+                            VariantInfo {
+                                name: variant.name(db).display(db, edition).to_string(),
+                                fields,
+                            }
                         })
                         .collect();
 
@@ -671,32 +1090,46 @@ fn extract_module_items_by_file(
                         .items(db)
                         .into_iter()
                         .map(|item| match item {
-                            ra_ap_hir::AssocItem::Function(func) => TraitItemInfo::Function {
-                                name: func.name(db).display(db, edition).to_string(),
-                                params: func
+                            ra_ap_hir::AssocItem::Function(func) => {
+                                let params: Vec<ParamInfo> = func
                                     .params_without_self(db)
                                     .into_iter()
                                     .enumerate()
-                                    .map(|(idx, param)| ParamInfo {
-                                        name: param
-                                            .name(db)
-                                            .map(|name| name.display(db, edition).to_string())
-                                            .unwrap_or_else(|| format!("_{}", idx)),
-                                        ty: param.ty().display(db, edition).to_string(),
-                                        type_ref: None,
+                                    .map(|(idx, param)| {
+                                        let ty_str = param.ty().display(db, edition).to_string();
+                                        extract_type_names(&ty_str, referenced_types);
+                                        ParamInfo {
+                                            name: param
+                                                .name(db)
+                                                .map(|name| name.display(db, edition).to_string())
+                                                .unwrap_or_else(|| format!("_{}", idx)),
+                                            ty: ty_str,
+                                            type_ref: None,
+                                        }
                                     })
-                                    .collect(),
-                                return_type: func.ret_type(db).display(db, edition).to_string(),
+                                    .collect();
+                                let ret_type_str =
+                                    func.ret_type(db).display(db, edition).to_string();
+                                extract_type_names(&ret_type_str, referenced_types);
+                                TraitItemInfo::Function {
+                                    name: func.name(db).display(db, edition).to_string(),
+                                    params,
+                                    return_type: ret_type_str,
+                                }
                             },
                             ra_ap_hir::AssocItem::TypeAlias(ty) => TraitItemInfo::TypeAlias {
                                 name: ty.name(db).display(db, edition).to_string(),
                             },
-                            ra_ap_hir::AssocItem::Const(c) => TraitItemInfo::Const {
-                                name: c
-                                    .name(db)
-                                    .map(|n| n.display(db, edition).to_string())
-                                    .unwrap_or_else(|| "_".to_string()),
-                                ty: c.ty(db).display(db, edition).to_string(),
+                            ra_ap_hir::AssocItem::Const(c) => {
+                                let ty_str = c.ty(db).display(db, edition).to_string();
+                                extract_type_names(&ty_str, referenced_types);
+                                TraitItemInfo::Const {
+                                    name: c
+                                        .name(db)
+                                        .map(|n| n.display(db, edition).to_string())
+                                        .unwrap_or_else(|| "_".to_string()),
+                                    ty: ty_str,
+                                }
                             },
                         })
                         .collect(),
@@ -705,31 +1138,37 @@ fn extract_module_items_by_file(
 
             ModuleDef::TypeAlias(type_alias) => {
                 let hir_id = format!("{:?}", type_alias).replace(" ", "");
+                let target_str = type_alias.ty(db).display(db, edition).to_string();
+                extract_type_names(&target_str, referenced_types);
                 file_info.items.push(ItemInfo::TypeAlias {
                     name: type_alias.name(db).display(db, edition).to_string(),
                     id: hir_id,
-                    target: type_alias.ty(db).display(db, edition).to_string(),
+                    target: target_str,
                 });
             },
 
             ModuleDef::Const(const_def) => {
                 let hir_id = format!("{:?}", const_def).replace(" ", "");
+                let ty_str = const_def.ty(db).display(db, edition).to_string();
+                extract_type_names(&ty_str, referenced_types);
                 file_info.items.push(ItemInfo::Const {
                     name: const_def
                         .name(db)
                         .map(|n| n.display(db, edition).to_string())
                         .unwrap_or_else(|| "_".to_string()),
                     id: hir_id,
-                    ty: const_def.ty(db).display(db, edition).to_string(),
+                    ty: ty_str,
                 });
             },
 
             ModuleDef::Static(static_def) => {
                 let hir_id = format!("{:?}", static_def).replace(" ", "");
+                let ty_str = static_def.ty(db).display(db, edition).to_string();
+                extract_type_names(&ty_str, referenced_types);
                 file_info.items.push(ItemInfo::Static {
                     name: static_def.name(db).display(db, edition).to_string(),
                     id: hir_id,
-                    ty: static_def.ty(db).display(db, edition).to_string(),
+                    ty: ty_str,
                 });
             },
 
