@@ -22,10 +22,6 @@ struct Args {
     /// Watch for file changes and re-analyze (development mode)
     #[arg(short, long)]
     watch: bool,
-
-    /// Include external library type information (dependencies from crates.io, etc.)
-    #[arg(short = 'e', long)]
-    include_external: bool,
 }
 
 fn main() -> Result<()> {
@@ -58,13 +54,7 @@ fn main() -> Result<()> {
         println!("Press Ctrl+C to stop\n");
 
         // Initial analysis
-        analyze_and_save(
-            &host,
-            &vfs,
-            &project_dir,
-            args.include_external,
-            &manifest_path_abs,
-        )?;
+        analyze_and_save(&host, &vfs, &project_dir, &manifest_path_abs)?;
 
         // Setup file watcher
         let (tx, rx) = channel();
@@ -101,7 +91,6 @@ fn main() -> Result<()> {
                                     &host,
                                     &vfs,
                                     &project_dir,
-                                    args.include_external,
                                     &manifest_path_abs,
                                 ) {
                                     Ok(_) => println!("✅ Re-analysis complete\n"),
@@ -121,13 +110,7 @@ fn main() -> Result<()> {
         }
     } else {
         // Single run mode
-        analyze_and_save(
-            &host,
-            &vfs,
-            &project_dir,
-            args.include_external,
-            &manifest_path_abs,
-        )?;
+        analyze_and_save(&host, &vfs, &project_dir, &manifest_path_abs)?;
         println!("\n✨ Analysis complete!");
     }
 
@@ -138,12 +121,11 @@ fn analyze_and_save(
     db: &ra_ap_ide_db::RootDatabase,
     vfs: &ra_ap_vfs::Vfs,
     project_dir: &PathBuf,
-    include_external: bool,
     manifest_path: &PathBuf,
 ) -> Result<()> {
     // Extract type information per file
     let (file_infos, crate_metadata) =
-        analysis::extract_type_info_by_file(db, vfs, project_dir, include_external, manifest_path)?;
+        analysis::extract_type_info_by_file(db, vfs, project_dir, manifest_path)?;
 
     // Create output directory
     let output_dir = project_dir.join("target");

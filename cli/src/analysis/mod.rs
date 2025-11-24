@@ -82,7 +82,6 @@ pub fn extract_type_info_by_file(
     db: &RootDatabase,
     vfs: &Vfs,
     project_dir: &PathBuf,
-    include_external: bool,
     manifest_path: &PathBuf,
 ) -> Result<(FileInfoMap, Vec<CrateMetadata>)> {
     let crates = Crate::all(db);
@@ -94,23 +93,19 @@ pub fn extract_type_info_by_file(
         .cloned()
         .collect();
 
-    let external_crates: Vec<_> = if include_external {
-        crates
-            .into_iter()
-            .filter(|krate| !{
-                krate.origin(db).is_local()
-                    || STD_CRATES.contains(
-                        &krate
-                            .display_name(db)
-                            .map(|n| n.to_string())
-                            .unwrap_or_default()
-                            .as_str(),
-                    )
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let external_crates: Vec<_> = crates
+        .into_iter()
+        .filter(|krate| !{
+            krate.origin(db).is_local()
+                || STD_CRATES.contains(
+                    &krate
+                        .display_name(db)
+                        .map(|n| n.to_string())
+                        .unwrap_or_default()
+                        .as_str(),
+                )
+        })
+        .collect();
 
     let mut state = ExtractionState::new();
 

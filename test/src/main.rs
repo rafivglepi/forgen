@@ -1,4 +1,5 @@
-use forgen_test::{distance, midpoint, Point};
+#![allow(dead_code, unused_variables, unused_mut)]
+use forgen_tests::{distance, midpoint, Point};
 use serde::{Deserialize, Serialize};
 
 const PI: f64 = 3.1415;
@@ -8,20 +9,20 @@ type UserId = u64;
 type Score = f32;
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct User {
+pub(crate) struct User {
     pub id: UserId,
     pub name: String,
     score: Score,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct Admin {
+pub struct Admin {
     pub id: UserId,
-    level: u8,
+    pub(crate) level: u8,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub enum Role {
+enum Role {
     Guest,
     Member,
     Admin(Admin),

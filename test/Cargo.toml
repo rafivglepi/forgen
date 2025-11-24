@@ -1,5 +1,5 @@
 [package]
-name = "forgen-test"
+name = "forgen-tests"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,7 +7,7 @@ edition = "2021"
 path = "src/lib.rs"
 
 [[bin]]
-name = "forgen-test"
+name = "forgen-tests"
 path = "src/main.rs"
 
 [dependencies]
