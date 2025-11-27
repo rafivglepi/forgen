@@ -3,7 +3,7 @@ mod models;
 mod workspace;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use notify_debouncer_mini::{new_debouncer, notify::*};
 use ra_ap_paths::AbsPathBuf;
 use std::fs;
@@ -13,7 +13,19 @@ use std::time::Duration;
 
 /// Forgen - Enhanced compile-time macro information with type awareness
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
+#[command(version, about, long_about = None, bin_name = "cargo")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run the Forgen analyzer
+    Forgen(Args),
+}
+
+#[derive(Parser, Debug)]
 struct Args {
     /// Path to Cargo.toml (defaults to ./Cargo.toml in current directory)
     #[arg(value_name = "MANIFEST")]
@@ -25,7 +37,8 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let cli = Cli::parse();
+    let Command::Forgen(args) = cli.command;
 
     println!("🚀 Forgen - Enhanced Macro Compiler Info");
     println!("=========================================\n");
@@ -43,31 +56,36 @@ fn main() -> Result<()> {
     let manifest_path = AbsPathBuf::try_from(manifest_path_str)
         .map_err(|e| anyhow::anyhow!("Invalid path: {:?}", e))?;
 
+    // Get workspace info (root dir and source directories)
+    let workspace_info = workspace::get_workspace_info(&manifest_path_abs)?;
+
     // Load the workspace
     let (mut host, mut vfs) = workspace::load_workspace(&manifest_path)?;
-
-    // Get the project directory for watching
-    let project_dir = manifest_path_abs.parent().unwrap().to_path_buf();
 
     if args.watch {
         println!("👀 Watch mode enabled - monitoring for changes...\n");
         println!("Press Ctrl+C to stop\n");
 
         // Initial analysis
-        analyze_and_save(&host, &vfs, &project_dir, &manifest_path_abs)?;
+        analyze_and_save(&host, &vfs, &workspace_info.root, &manifest_path_abs)?;
 
         // Setup file watcher
         let (tx, rx) = channel();
         let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
 
-        // Watch the src directory
-        let src_path = project_dir.join("src");
-        debouncer
-            .watcher()
-            .watch(&src_path, RecursiveMode::Recursive)
-            .with_context(|| format!("Failed to watch {:?}", src_path))?;
+        // Watch all workspace member source directories
+        if workspace_info.members.is_empty() {
+            anyhow::bail!("No source directories found to watch");
+        }
 
-        println!("📁 Watching: {}\n", src_path.display());
+        for src_path in &workspace_info.members {
+            debouncer
+                .watcher()
+                .watch(src_path, RecursiveMode::Recursive)
+                .with_context(|| format!("Failed to watch {:?}", src_path))?;
+            println!("📁 Watching: {}", src_path.display());
+        }
+        println!();
 
         // Watch loop
         loop {
@@ -90,7 +108,7 @@ fn main() -> Result<()> {
                                 match analyze_and_save(
                                     &host,
                                     &vfs,
-                                    &project_dir,
+                                    &workspace_info.root,
                                     &manifest_path_abs,
                                 ) {
                                     Ok(_) => println!("✅ Re-analysis complete\n"),
@@ -110,7 +128,7 @@ fn main() -> Result<()> {
         }
     } else {
         // Single run mode
-        analyze_and_save(&host, &vfs, &project_dir, &manifest_path_abs)?;
+        analyze_and_save(&host, &vfs, &workspace_info.root, &manifest_path_abs)?;
         println!("\n✨ Analysis complete!");
     }
 

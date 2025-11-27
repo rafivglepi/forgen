@@ -8,6 +8,38 @@ use ra_ap_project_model::{CargoConfig, RustLibSource};
 use ra_ap_vfs::{Change, Vfs, VfsPath};
 use std::{collections::HashMap, fs, path::PathBuf};
 
+pub struct WorkspaceInfo {
+    pub root: PathBuf,
+    pub members: Vec<PathBuf>,
+}
+
+pub fn get_workspace_info(manifest_path: &PathBuf) -> Result<WorkspaceInfo> {
+    let metadata = MetadataCommand::new()
+        .manifest_path(manifest_path)
+        .exec()
+        .context("Failed to load cargo metadata")?;
+
+    let mut members = Vec::new();
+    for package in metadata.workspace_packages() {
+        let src_path = package.manifest_path.parent().unwrap().join("src");
+        if src_path.exists() {
+            members.push(src_path.into_std_path_buf());
+        }
+    }
+
+    let root = metadata.workspace_root.into_std_path_buf();
+
+    // If no workspace members found, fall back to root/src if it exists
+    if members.is_empty() {
+        let root_src = root.join("src");
+        if root_src.exists() {
+            members.push(root_src);
+        }
+    }
+
+    Ok(WorkspaceInfo { root, members })
+}
+
 pub fn load_workspace(manifest_path: &AbsPathBuf) -> Result<(RootDatabase, Vfs)> {
     let (host, vfs, _proc_macro) = load_workspace_at(
         manifest_path.parent().unwrap().as_ref(),

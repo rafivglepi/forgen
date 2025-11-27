@@ -13,3 +13,7 @@ use forgen::forgen
 
 At the start of every file you want to use Forgen in, import the forgen::forgen macro and use it globally with `#![forgen]`
 Before building, run `cargo forgen` to refresh the Forgen metadata, and while coding, run `cargo forgen --watch` to use hot reloading
+
+## Development
+
+For more detailed information, see [CONTRIBUTING.md](CONTRIBUTING.md).
