@@ -63,6 +63,7 @@ pub fn load_workspace(manifest_path: &AbsPathBuf) -> Result<(RootDatabase, Vfs)>
     Ok((host, vfs))
 }
 
+#[allow(dead_code)]
 pub fn load_cargo_metadata(
     manifest_path: &PathBuf,
 ) -> Result<HashMap<String, (String, Vec<String>)>> {
@@ -127,10 +128,10 @@ pub fn apply_file_changes(
                     let text = String::from_utf8(contents)
                         .with_context(|| format!("File {:?} is not valid UTF-8", file_id))?;
                     change.change_file(file_id, Some(text));
-                },
+                }
                 Change::Delete => {
                     change.change_file(file_id, None);
-                },
+                }
             }
         }
 

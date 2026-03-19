@@ -1,17 +1,22 @@
-mod analysis;
-mod models;
+mod plugin;
+mod plugins;
 mod workspace;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use notify_debouncer_mini::{new_debouncer, notify::*};
+use ra_ap_hir::{Crate, HirDisplay, Semantics};
+use ra_ap_ide_db::{base_db::SourceDatabase, EditionedFileId, FileId, RootDatabase};
 use ra_ap_paths::AbsPathBuf;
+use ra_ap_syntax::{ast, AstNode, Edition};
+use ra_ap_vfs::Vfs;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
-/// Forgen - Enhanced compile-time macro information with type awareness
+/// Forgen - compile-time codegen for Rust
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None, bin_name = "cargo")]
 struct Cli {
@@ -21,7 +26,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run the Forgen analyzer
+    /// Run the Forgen plugin runner
     Forgen(Args),
 }
 
@@ -31,7 +36,7 @@ struct Args {
     #[arg(value_name = "MANIFEST")]
     manifest: Option<PathBuf>,
 
-    /// Watch for file changes and re-analyze (development mode)
+    /// Watch for file changes and re-run plugins (development mode)
     #[arg(short, long)]
     watch: bool,
 }
@@ -40,15 +45,12 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let Command::Forgen(args) = cli.command;
 
-    println!("🚀 Forgen - Enhanced Macro Compiler Info");
+    println!("🚀 Forgen");
     println!("=========================================\n");
 
-    // Default to current directory's Cargo.toml if not specified
     let manifest_path = args.manifest.unwrap_or_else(|| PathBuf::from("Cargo.toml"));
-
     println!("📦 Loading project: {}", manifest_path.display());
 
-    // Convert to absolute path
     let manifest_path_abs = manifest_path.canonicalize()?;
     let manifest_path_str = manifest_path_abs
         .to_str()
@@ -56,24 +58,18 @@ fn main() -> Result<()> {
     let manifest_path = AbsPathBuf::try_from(manifest_path_str)
         .map_err(|e| anyhow::anyhow!("Invalid path: {:?}", e))?;
 
-    // Get workspace info (root dir and source directories)
     let workspace_info = workspace::get_workspace_info(&manifest_path_abs)?;
-
-    // Load the workspace
     let (mut host, mut vfs) = workspace::load_workspace(&manifest_path)?;
 
     if args.watch {
         println!("👀 Watch mode enabled - monitoring for changes...\n");
         println!("Press Ctrl+C to stop\n");
 
-        // Initial analysis
-        analyze_and_save(&host, &vfs, &workspace_info.root, &manifest_path_abs)?;
+        run_plugins(&host, &vfs, &workspace_info.root)?;
 
-        // Setup file watcher
         let (tx, rx) = channel();
         let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
 
-        // Watch all workspace member source directories
         if workspace_info.members.is_empty() {
             anyhow::bail!("No source directories found to watch");
         }
@@ -87,11 +83,9 @@ fn main() -> Result<()> {
         }
         println!();
 
-        // Watch loop
         loop {
             match rx.recv() {
                 Ok(Ok(events)) => {
-                    // Check if any Rust files changed
                     let changed_files: Vec<_> = events
                         .iter()
                         .filter(|e| e.path.extension().and_then(|s| s.to_str()) == Some("rs"))
@@ -99,72 +93,164 @@ fn main() -> Result<()> {
                         .collect();
 
                     if !changed_files.is_empty() {
-                        println!("🔄 File change detected, re-analyzing...");
+                        println!("🔄 File change detected, re-running plugins...");
 
-                        // Apply file changes incrementally (fast!)
                         match workspace::apply_file_changes(&mut host, &mut vfs, &changed_files) {
-                            Ok(_) => {
-                                // Re-analyze with the updated database
-                                match analyze_and_save(
-                                    &host,
-                                    &vfs,
-                                    &workspace_info.root,
-                                    &manifest_path_abs,
-                                ) {
-                                    Ok(_) => println!("✅ Re-analysis complete\n"),
-                                    Err(e) => eprintln!("❌ Error during re-analysis: {}\n", e),
-                                }
+                            Ok(_) => match run_plugins(&host, &vfs, &workspace_info.root) {
+                                Ok(_) => println!("✅ Done\n"),
+                                Err(e) => eprintln!("❌ Plugin error: {}\n", e),
                             },
                             Err(e) => eprintln!("❌ Error applying file changes: {}\n", e),
                         }
                     }
-                },
+                }
                 Ok(Err(e)) => eprintln!("Watch error: {:?}", e),
                 Err(e) => {
                     eprintln!("Channel error: {:?}", e);
                     break;
-                },
+                }
             }
         }
     } else {
-        // Single run mode
-        analyze_and_save(&host, &vfs, &workspace_info.root, &manifest_path_abs)?;
-        println!("\n✨ Analysis complete!");
+        run_plugins(&host, &vfs, &workspace_info.root)?;
+        println!("\n✨ Done!");
     }
 
     Ok(())
 }
 
-fn analyze_and_save(
-    db: &ra_ap_ide_db::RootDatabase,
-    vfs: &ra_ap_vfs::Vfs,
-    project_dir: &PathBuf,
-    manifest_path: &PathBuf,
-) -> Result<()> {
-    // Extract type information per file
-    let (file_infos, crate_metadata) =
-        analysis::extract_type_info_by_file(db, vfs, project_dir, manifest_path)?;
+/// Run all registered plugins over every local source file and save the
+/// resulting replacements to `target/.forgen/<mirrored-path>.json`.
+/// Source files are never touched — a macro will read the JSON and apply
+/// the replacements at compile time.
+fn run_plugins(db: &RootDatabase, vfs: &Vfs, project_dir: &PathBuf) -> Result<()> {
+    let sema = Semantics::new(db);
 
-    // Create output directory
-    let output_dir = project_dir.join("target");
-    fs::create_dir_all(&output_dir)?;
+    // Registered plugins — hardcoded for now, dylib loading comes later.
+    let plugins: Vec<Box<dyn plugin::Plugin>> =
+        vec![Box::new(plugins::f64_logger::F64LoggerPlugin)];
 
-    // Convert the map into a vec of FileTypeInfo
-    let files: Vec<models::FileTypeInfo> = file_infos.into_values().collect();
+    // Collect all unique source files reachable from local crates.
+    let mut seen: HashSet<FileId> = HashSet::new();
+    let mut file_queue: Vec<EditionedFileId> = Vec::new();
 
-    // Create the complete output structure
-    let output = models::ForgenOutput {
-        crates: crate_metadata,
-        files,
-    };
+    for krate in Crate::all(db) {
+        if krate.origin(db).is_local() {
+            collect_module_files(db, &krate.root_module(), &mut seen, &mut file_queue);
+        }
+    }
 
-    // Save everything to a single .forgen.json file (minified)
-    let output_file = output_dir.join(".forgen.json");
-    let json = serde_json::to_string(&output)?;
-    fs::write(&output_file, json)?;
+    println!("🔍 Running plugins on {} file(s)...", file_queue.len());
 
-    println!("💾 Saved type information to: {}", output_file.display());
-    println!("✨ Analyzed {} files", output.files.len());
+    let mut total_changes = 0;
+
+    for editioned_id in file_queue {
+        let file_id = editioned_id.file_id();
+
+        let Some(path) = workspace::file_id_to_path(vfs, file_id, project_dir) else {
+            continue;
+        };
+
+        // Source text from the database (consistent with what sema.parse will use).
+        let source = String::from(&*SourceDatabase::file_text(db, file_id));
+
+        // Parse through sema so that descendant nodes are registered for type
+        // queries (type_of_expr / type_of_pat).
+        let parsed = sema.parse(editioned_id);
+
+        // Pre-compute inferred types for every `let` binding that lacks an
+        // explicit annotation. We use type_of_expr on the initialiser rather
+        // than type_of_pat so we get the concrete, post-inference type.
+        let mut pat_types: HashMap<(u32, u32), String> = HashMap::new();
+        for node in parsed.syntax().descendants() {
+            let Some(let_stmt) = ast::LetStmt::cast(node) else {
+                continue;
+            };
+            // Skip bindings that already have a written type — the plugin
+            // will read those directly from the syntax tree.
+            if let_stmt.ty().is_some() {
+                continue;
+            }
+            let Some(pat) = let_stmt.pat() else { continue };
+            let Some(init) = let_stmt.initializer() else {
+                continue;
+            };
+
+            if let Some(type_info) = sema.type_of_expr(&init) {
+                let ty_str = type_info.original.display(db, Edition::CURRENT).to_string();
+                let r = pat.syntax().text_range();
+                pat_types.insert((u32::from(r.start()), u32::from(r.end())), ty_str);
+            }
+        }
+
+        let ctx = plugin::FileContext::new(path.clone(), source.clone(), parsed, pat_types);
+
+        // Gather replacements from every plugin.
+        let mut all_replacements: Vec<plugin::Replacement> = Vec::new();
+        for p in &plugins {
+            all_replacements.extend(p.run(&ctx));
+        }
+
+        if all_replacements.is_empty() {
+            continue;
+        }
+
+        // Keep replacements in source order for readability in the JSON.
+        all_replacements.sort_by_key(|r| r.range.start);
+
+        // Mirror the source path under target/.forgen/, appending ".json".
+        // e.g. src/lib.rs  →  target/.forgen/src/lib.rs.json
+        let relative_path = path.strip_prefix(project_dir).unwrap_or(&path);
+        let output_dir = project_dir.join("target").join(".forgen").join(
+            relative_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("")),
+        );
+        fs::create_dir_all(&output_dir)?;
+
+        let mut output_name = relative_path.file_name().unwrap_or_default().to_os_string();
+        output_name.push(".json");
+        let output_path = output_dir.join(output_name);
+
+        let json = serde_json::to_string_pretty(&all_replacements)?;
+        fs::write(&output_path, &json)?;
+
+        println!(
+            "  💾 {} → {} replacement(s)",
+            relative_path.display(),
+            all_replacements.len()
+        );
+        total_changes += all_replacements.len();
+    }
+
+    println!();
+    if total_changes > 0 {
+        println!(
+            "✅ Saved {} total replacement(s) to target/.forgen/",
+            total_changes
+        );
+    } else {
+        println!("✅ No replacements generated");
+    }
 
     Ok(())
+}
+
+/// Recursively collect the `EditionedFileId` of every module in the subtree
+/// rooted at `module`, deduplicating via the plain `FileId`.
+fn collect_module_files(
+    db: &RootDatabase,
+    module: &ra_ap_hir::Module,
+    seen: &mut HashSet<FileId>,
+    queue: &mut Vec<EditionedFileId>,
+) {
+    if let Some(editioned_id) = module.definition_source(db).file_id.file_id() {
+        let file_id = editioned_id.file_id();
+        if seen.insert(file_id) {
+            queue.push(editioned_id);
+        }
+    }
+    for child in module.children(db) {
+        collect_module_files(db, &child, seen, queue);
+    }
 }

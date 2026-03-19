@@ -1,11 +1,27 @@
 # Architecture
 
-Forgen works by acting both as a macro and a cli:
+Forgen is a CLI tool (`cargo forgen`) that runs rust-analyzer at runtime, feeds source files to plugins, and applies the textual replacements they return directly back to disk.
 
-- Running `cargo forgen` will generate a dump file of data from Rust Analyzer at `/target/.forgen.json`
-- Using the `#![forgen]` macro imports all plugins defined in `/build.rs`, and provides both the span information and metadata (using `include_str!` and parsing the dump file) to plugins, which can edit the code as a normal macro would
+```
+source files
+     │
+     ▼
+rust-analyzer (ra_ap_*)          ← loaded once, reused across files
+     │  type inference
+     ▼
+FileContext  ──────────────────── handed to each plugin
+  • path / source / syntax tree
+  • pre-computed inferred types
+     │
+     ▼
+Plugin::run(&ctx) → Vec<Replacement>
+  { range: { start, end }, text }   ← same shape future dylibs will return
+     │
+     ▼
+replacements applied back-to-front → source files updated on disk
+```
 
-This metadata includes types, a directory tree, and anything else plugins might add.
+Plugins receive a `FileContext` that intentionally does **not** expose rust-analyzer types directly — so that, when dylib loading lands, plugins won't need ra_ap_* as a dependency.
 
 ## Workspace
 
@@ -28,17 +44,18 @@ You need to install `cargo-forgen` in your path to use it in tests or checks. Fo
 
 ## Roadmap
 
-- [x] Extracting types
-  - [x] From current crate
-  - [x] From external libraries
-- [ ] Parsing the dump file back into data
-- [ ] Optional gzip compression in the cli
-- [ ] Dump file hashing (for not reloading unecessarily)
-- [ ] Initial macro with standard capabilities
-  - [ ] comptime! macro with access to type information (similar to Zig's)
-- [ ] Plugin API
-  - [ ] Dynamic plugin loading via build.rs
-  - [ ] Stable API for bridging macro span info with Forgen metadata
+- [x] Load workspace with rust-analyzer at runtime
+- [x] Type inference for local `let` bindings via `Semantics`
+- [x] Plugin trait + `FileContext` API (no ra_ap_* exposure to plugins)
+- [x] Replacement format `{ range: { start, end }, text }`
+- [x] Hardcoded f64-logger plugin (explicit + inferred `f64` bindings)
+- [x] Idempotent insertions (re-running forgen is safe)
+- [ ] Watch mode re-applying plugins on file save
+- [ ] Dylib plugin loading (plugins as `.dll` / `.so`)
+- [ ] `SyntaxNode`-compatible wrapper enum so plugins work without ra_ap_syntax
+- [ ] Plugin registry in `build.rs` / `forgen.toml`
+- [ ] `comptime!` macro with live type access (similar to Zig's comptime)
+- [ ] Stable ABI for `FileContext` and `Replacement`
 
 ---
 
