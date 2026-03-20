@@ -2,25 +2,6 @@
 
 Forgen is a CLI tool (`cargo forgen`) that runs rust-analyzer at runtime, feeds source files to plugins, and applies the textual replacements they return directly back to disk.
 
-```
-source files
-     │
-     ▼
-rust-analyzer (ra_ap_*)          ← loaded once, reused across files
-     │  type inference
-     ▼
-FileContext  ──────────────────── handed to each plugin
-  • path / source / syntax tree
-  • pre-computed inferred types
-     │
-     ▼
-Plugin::run(&ctx) → Vec<Replacement>
-  { range: { start, end }, text }   ← same shape future dylibs will return
-     │
-     ▼
-replacements applied back-to-front → source files updated on disk
-```
-
 Plugins receive a `FileContext` that intentionally does **not** expose rust-analyzer types directly — so that, when dylib loading lands, plugins won't need ra_ap_* as a dependency.
 
 ## Workspace

@@ -1,4 +1,4 @@
 [workspace]
-members = ["cli", "test"]
+members = ["api", "cli", "test"]
 
 resolver = "2"

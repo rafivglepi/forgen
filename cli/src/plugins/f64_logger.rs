@@ -1,13 +1,12 @@
-use crate::plugin::{FileContext, Plugin, Replacement};
-use ra_ap_syntax::{ast, ast::HasName, AstNode};
+use forgen_api::{FileReplacement, Plugin, Replacement, WorkspaceContext};
 
 /// Inserts a `println!` trace line after every `let` binding whose type is
 /// `f64`, whether the annotation is written explicitly (`let x: f64 = …`)
 /// or inferred (`let x = some_f64_expr`).
 ///
-/// The insertion is idempotent: if the line immediately following the
-/// statement already contains a `println!` for the same variable name, the
-/// plugin skips that binding.
+/// This plugin is a built-in example that ships with `cargo-forgen`. It also
+/// serves as a reference implementation for authors writing their own dylib
+/// plugins: notice that it only depends on `forgen-api` — no `ra_ap_*` crates.
 pub struct F64LoggerPlugin;
 
 impl Plugin for F64LoggerPlugin {
@@ -15,58 +14,47 @@ impl Plugin for F64LoggerPlugin {
         "f64-logger"
     }
 
-    fn run(&self, ctx: &FileContext) -> Vec<Replacement> {
-        let mut replacements = Vec::new();
+    fn run(&self, ctx: &WorkspaceContext) -> Vec<FileReplacement> {
+        let mut results = Vec::new();
 
-        for node in ctx.syntax.syntax().descendants() {
-            let Some(let_stmt) = ast::LetStmt::cast(node) else {
-                continue;
-            };
+        for file in &ctx.files {
+            let mut replacements = Vec::new();
 
-            // Only handle simple identifier patterns: `let [mut] name [: T] = …`
-            let Some(pat) = let_stmt.pat() else {
-                continue;
-            };
-            let var_name = match &pat {
-                ast::Pat::IdentPat(ident_pat) => ident_pat.name().map(|n: ast::Name| n.to_string()),
-                _ => None,
-            };
-            let Some(var_name) = var_name else {
-                continue;
-            };
+            for binding in file.bindings_of_type("f64") {
+                // Insertion point: right after the closing `;` of the statement.
+                let insert_at = binding.range.end;
 
-            // Decide whether this binding has type f64.
-            let is_f64 = if let Some(ty_node) = let_stmt.ty() {
-                // Explicit annotation — compare the literal source text.
-                ty_node.syntax().text().to_string().trim() == "f64"
-            } else {
-                // No annotation — use the pre-computed inferred type.
-                ctx.type_of_pat(&pat) == Some("f64")
-            };
+                // Replicate the indentation of the line that contains the `let`.
+                let indent = leading_indent(&file.source, insert_at);
 
-            if !is_f64 {
-                continue;
+                replacements.push(Replacement::insert(
+                    insert_at,
+                    format!(
+                        "\n{indent}println!(\"{name}: {{}}\", {name});",
+                        indent = indent,
+                        name = binding.name,
+                    ),
+                ));
             }
 
-            // Where to insert: right after the closing `;` of the statement.
-            let insert_at = u32::from(let_stmt.syntax().text_range().end());
-
-            // Replicate the indentation of the current line.
-            let line_start = ctx.source[..insert_at as usize]
-                .rfind('\n')
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            let indent: String = ctx.source[line_start..]
-                .chars()
-                .take_while(|c| *c == ' ' || *c == '\t')
-                .collect();
-
-            replacements.push(Replacement::insert(
-                insert_at,
-                format!("\n{indent}println!(\"{var_name}: {{}}\", {var_name});"),
-            ));
+            if !replacements.is_empty() {
+                results.push(FileReplacement::new(file.path.clone(), replacements));
+            }
         }
 
-        replacements
+        results
     }
 }
+
+/// Returns the leading whitespace (spaces and tabs) of the line that contains
+/// `offset` (a byte offset into `source`).
+fn leading_indent(source: &str, offset: u32) -> String {
+    let up_to = (offset as usize).min(source.len());
+    let line_start = source[..up_to].rfind('\n').map(|i| i + 1).unwrap_or(0);
+
+    source[line_start..]
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect()
+}
+

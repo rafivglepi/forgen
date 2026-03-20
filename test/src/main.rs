@@ -77,7 +77,6 @@ fn main() {
     let p1 = Point { x: 0.0, y: 0.0 };
     let p2 = Point { x: 3.0, y: 4.0 };
     let dist = distance(&p1, &p2);
-    println!("dist: {}", dist);
     let mid = midpoint(&p1, &p2);
     println!("Distance: {}, Midpoint: ({}, {})", dist, mid.x, mid.y);
 
