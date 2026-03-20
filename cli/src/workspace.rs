@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use cargo_metadata::MetadataCommand;
+use cargo_metadata::{Metadata, MetadataCommand};
 use ra_ap_hir::ChangeWithProcMacros;
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice};
@@ -11,6 +11,9 @@ use std::{collections::HashMap, fs, path::PathBuf};
 pub struct WorkspaceInfo {
     pub root: PathBuf,
     pub members: Vec<PathBuf>,
+    /// The raw `cargo metadata` output — available for plugin discovery and
+    /// manifest inspection without running `cargo metadata` a second time.
+    pub cargo_metadata: Metadata,
 }
 
 pub fn get_workspace_info(manifest_path: &PathBuf) -> Result<WorkspaceInfo> {
@@ -27,7 +30,7 @@ pub fn get_workspace_info(manifest_path: &PathBuf) -> Result<WorkspaceInfo> {
         }
     }
 
-    let root = metadata.workspace_root.into_std_path_buf();
+    let root = metadata.workspace_root.as_std_path().to_path_buf();
 
     // If no workspace members found, fall back to root/src if it exists
     if members.is_empty() {
@@ -37,7 +40,11 @@ pub fn get_workspace_info(manifest_path: &PathBuf) -> Result<WorkspaceInfo> {
         }
     }
 
-    Ok(WorkspaceInfo { root, members })
+    Ok(WorkspaceInfo {
+        root,
+        members,
+        cargo_metadata: metadata,
+    })
 }
 
 pub fn load_workspace(manifest_path: &AbsPathBuf) -> Result<(RootDatabase, Vfs)> {

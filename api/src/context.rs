@@ -1,4 +1,6 @@
+use crate::syntax::raw::RawNode;
 use crate::TextRange;
+use crate::{manifest::WorkspaceManifest, tree::DirNode};
 use serde::{Deserialize, Serialize};
 
 /// The entire workspace handed to every plugin in one shot.
@@ -15,6 +17,12 @@ pub struct WorkspaceContext {
 
     /// Every Rust source file reachable from a local crate in the workspace.
     pub files: Vec<FileContext>,
+
+    /// Cargo metadata for the whole workspace.
+    pub manifest: WorkspaceManifest,
+
+    /// The source file tree rooted at the workspace root.
+    pub file_tree: DirNode,
 }
 
 impl WorkspaceContext {
@@ -43,6 +51,9 @@ pub struct FileContext {
 
     /// Raw UTF-8 source text exactly as it exists on disk.
     pub source: String,
+
+    /// The full CST of this file, with all trivia (whitespace, comments).
+    pub tree: RawNode,
 
     /// Every `let` binding in the file, across all scopes (flattened).
     /// This includes bindings inside function bodies, closures, blocks, etc.

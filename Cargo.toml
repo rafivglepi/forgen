@@ -1,4 +1,7 @@
 [workspace]
-members = ["api", "cli", "test"]
+members = ["api", "cli", "example-plugin", "test"]
 
 resolver = "2"
+
+[workspace.metadata.forgen]
+plugins = ["example-plugin"]

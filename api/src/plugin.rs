@@ -109,13 +109,13 @@ macro_rules! plugin_export {
                     .expect("forgen_run: ctx_json is not valid UTF-8")
             };
 
-            let ctx: $crate::WorkspaceContext = ::serde_json::from_str(ctx_str)
+            let ctx: $crate::WorkspaceContext = $crate::serde_json::from_str(ctx_str)
                 .expect("forgen_run: failed to deserialise WorkspaceContext");
 
             let plugin = <$plugin_type as ::std::default::Default>::default();
             let result = $crate::Plugin::run(&plugin, &ctx);
 
-            let json = ::serde_json::to_string(&result)
+            let json = $crate::serde_json::to_string(&result)
                 .expect("forgen_run: failed to serialise Vec<FileReplacement>");
 
             ::std::ffi::CString::new(json)
@@ -140,4 +140,3 @@ macro_rules! plugin_export {
         }
     };
 }
-

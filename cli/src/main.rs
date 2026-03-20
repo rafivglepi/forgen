@@ -3,21 +3,25 @@ mod plugins;
 mod workspace;
 
 use anyhow::{Context, Result};
+use cargo_metadata::DependencyKind as CargoDep;
 use clap::{Parser, Subcommand};
 use forgen_api::{
-    EnumDef, FieldDef, FileContext as ApiFileContext, FnDef, FnParam, ImplDef, LetBinding, Plugin,
-    StructDef, TextRange as ApiTextRange, VariantDef, WorkspaceContext,
+    syntax::raw::{Child as SyntaxChild, RawNode, RawToken},
+    syntax::SyntaxKind,
+    Dependency, DependencySource, DirNode, EnumDef, FieldDef, FileContext as ApiFileContext,
+    FileRef, FnDef, FnParam, FsEntry, ImplDef, LetBinding, PackageManifest, Plugin, StructDef,
+    TextRange as ApiTextRange, VariantDef, WorkspaceContext, WorkspaceManifest,
 };
 use notify_debouncer_mini::{new_debouncer, notify::*};
 use ra_ap_hir::{Crate, HirDisplay, Semantics};
 use ra_ap_ide_db::{base_db::SourceDatabase, EditionedFileId, FileId, RootDatabase};
 use ra_ap_paths::AbsPathBuf;
-use ra_ap_syntax::{ast, ast::HasName, ast::HasVisibility, AstNode, Edition};
+use ra_ap_syntax::{ast, ast::HasName, ast::HasVisibility, AstNode, Edition, SyntaxElement};
 use ra_ap_vfs::Vfs;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::mpsc::channel;
+use std::sync::{mpsc::channel, OnceLock};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -77,7 +81,7 @@ fn main() -> Result<()> {
         println!("👀 Watch mode enabled - monitoring for changes...\n");
         println!("Press Ctrl+C to stop\n");
 
-        run_plugins(&host, &vfs, &workspace_info.root)?;
+        run_plugins(&host, &vfs, &workspace_info)?;
 
         let (tx, rx) = channel();
         let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
@@ -106,9 +110,8 @@ fn main() -> Result<()> {
 
                     if !changed_files.is_empty() {
                         println!("🔄 File change detected, re-running plugins...");
-
                         match workspace::apply_file_changes(&mut host, &mut vfs, &changed_files) {
-                            Ok(_) => match run_plugins(&host, &vfs, &workspace_info.root) {
+                            Ok(_) => match run_plugins(&host, &vfs, &workspace_info) {
                                 Ok(_) => println!("✅ Done\n"),
                                 Err(e) => eprintln!("❌ Plugin error: {}\n", e),
                             },
@@ -124,7 +127,7 @@ fn main() -> Result<()> {
             }
         }
     } else {
-        run_plugins(&host, &vfs, &workspace_info.root)?;
+        run_plugins(&host, &vfs, &workspace_info)?;
         println!("\n✨ Done!");
     }
 
@@ -135,29 +138,38 @@ fn main() -> Result<()> {
 // Plugin runner
 // ---------------------------------------------------------------------------
 
-/// Build the workspace context, run every plugin against it, and persist the
-/// resulting `FileReplacement` lists to `target/.forgen/<path>.json`.
-///
-/// Source files are **never** modified — macros read the JSON at compile time.
-fn run_plugins(db: &RootDatabase, vfs: &Vfs, project_dir: &PathBuf) -> Result<()> {
-    // Collect built-in plugins first.
+fn run_plugins(
+    db: &RootDatabase,
+    vfs: &Vfs,
+    workspace_info: &workspace::WorkspaceInfo,
+) -> Result<()> {
+    let project_dir = &workspace_info.root;
+    let cargo_meta = &workspace_info.cargo_metadata;
+
+    // Built-in plugins.
     let mut plugins: Vec<Box<dyn Plugin>> = vec![Box::new(plugins::f64_logger::F64LoggerPlugin)];
 
-    // Load any dylib plugins from <workspace>/forgen-plugins/.
+    // Dylib plugins from `forgen-plugins/` directory (manual drop-in).
     let dylib_dir = project_dir.join("forgen-plugins");
     if dylib_dir.exists() {
-        let dylib_plugins = loader::load_plugins_from_dir(&dylib_dir);
-        if !dylib_plugins.is_empty() {
-            println!("  📦 Loaded {} dylib plugin(s)\n", dylib_plugins.len());
-        }
-        plugins.extend(dylib_plugins);
+        plugins.extend(loader::load_plugins_from_dir(&dylib_dir));
     }
 
-    // Enumerate every source file reachable from a local crate.
+    // Workspace-metadata plugins: `[workspace.metadata.forgen] plugins = [...]`
+    let workspace_plugins = loader::load_workspace_plugins(cargo_meta);
+    if !workspace_plugins.is_empty() {
+        println!(
+            "  📦 Loaded {} workspace plugin(s)\n",
+            workspace_plugins.len()
+        );
+        plugins.extend(workspace_plugins);
+    }
+
     let sema = Semantics::new(db);
+
+    // Enumerate source files.
     let mut seen: HashSet<FileId> = HashSet::new();
     let mut file_queue: Vec<EditionedFileId> = Vec::new();
-
     for krate in Crate::all(db) {
         if krate.origin(db).is_local() {
             collect_module_files(db, &krate.root_module(), &mut seen, &mut file_queue);
@@ -169,8 +181,8 @@ fn run_plugins(db: &RootDatabase, vfs: &Vfs, project_dir: &PathBuf) -> Result<()
         file_queue.len()
     );
 
-    // Build the full WorkspaceContext *before* calling any plugin.
-    let workspace_ctx = build_workspace_context(&sema, db, vfs, project_dir, file_queue)?;
+    let workspace_ctx =
+        build_workspace_context(&sema, db, vfs, project_dir, file_queue, cargo_meta)?;
 
     println!("🧩 Running {} plugin(s)...\n", plugins.len());
 
@@ -184,11 +196,8 @@ fn run_plugins(db: &RootDatabase, vfs: &Vfs, project_dir: &PathBuf) -> Result<()
                 continue;
             }
 
-            // Sort in source order for readable JSON diffs.
             fr.replacements.sort_by_key(|r| r.range.start);
 
-            // Mirror the source path under target/.forgen/, appending ".json".
-            // e.g.  "test/src/lib.rs"  →  target/.forgen/test/src/lib.rs.json
             let rel_path = std::path::Path::new(&fr.path);
             let output_dir = project_dir.join("target").join(".forgen").join(
                 rel_path
@@ -237,6 +246,7 @@ fn build_workspace_context(
     vfs: &Vfs,
     project_dir: &PathBuf,
     file_queue: Vec<EditionedFileId>,
+    cargo_meta: &cargo_metadata::Metadata,
 ) -> Result<WorkspaceContext> {
     let mut files: Vec<ApiFileContext> = Vec::new();
 
@@ -247,24 +257,16 @@ fn build_workspace_context(
             continue;
         };
 
-        // Read source text from the database (consistent with sema.parse).
         let source = String::from(&*SourceDatabase::file_text(db, file_id));
-
-        // Parse through sema so that descendant nodes are registered for type
-        // queries (type_of_expr / type_of_pat).
         let parsed = sema.parse(editioned_id);
         let syntax = parsed.syntax();
 
         // Pre-compute inferred types for unannotated `let` bindings.
-        // We use type_of_expr on the initialiser to get the concrete, post-
-        // inference type even when no annotation is written.
         let mut pat_type_cache: HashMap<(u32, u32), String> = HashMap::new();
         for node in syntax.descendants() {
             let Some(let_stmt) = ast::LetStmt::cast(node) else {
                 continue;
             };
-            // Annotated bindings don't need inference — the plugin reads the
-            // explicit type directly from the pre-computed LetBinding.
             if let_stmt.ty().is_some() {
                 continue;
             }
@@ -272,7 +274,6 @@ fn build_workspace_context(
             let Some(init) = let_stmt.initializer() else {
                 continue;
             };
-
             if let Some(type_info) = sema.type_of_expr(&init) {
                 let ty_str = type_info.original.display(db, Edition::CURRENT).to_string();
                 let r = pat.syntax().text_range();
@@ -280,16 +281,19 @@ fn build_workspace_context(
             }
         }
 
-        // Workspace-relative path using forward slashes on all platforms.
         let rel_path = path
             .strip_prefix(project_dir)
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
 
+        // Build the full serialisable CST (includes all trivia/comments).
+        let tree = build_raw_node(syntax);
+
         files.push(ApiFileContext {
             path: rel_path,
             source,
+            tree,
             let_bindings: extract_let_bindings(syntax, &pat_type_cache),
             functions: extract_functions(syntax),
             structs: extract_structs(syntax),
@@ -298,17 +302,525 @@ fn build_workspace_context(
         });
     }
 
+    let manifest = build_manifest(cargo_meta);
+    let file_tree = build_file_tree(&files);
+
     Ok(WorkspaceContext {
         workspace_root: project_dir.to_string_lossy().replace('\\', "/"),
+        manifest,
+        file_tree,
         files,
     })
 }
 
 // ---------------------------------------------------------------------------
-// AST → API type converters
+// CST converter  (ra_ap_syntax → forgen_api::syntax)
 // ---------------------------------------------------------------------------
 
-/// Convert a ra_ap_syntax `TextRange` to the API's `TextRange`.
+/// Converts a `ra_ap_syntax::SyntaxKind` to our `SyntaxKind` via the debug-
+/// string name. This avoids binding to the internal numeric representation of
+/// ra_ap_syntax and degrades gracefully (unknown → `ERROR`) when using an
+/// older or newer version of ra_ap_syntax that has different variants.
+fn convert_kind(k: ra_ap_syntax::SyntaxKind) -> SyntaxKind {
+    type A = SyntaxKind;
+    static MAP: OnceLock<HashMap<&'static str, SyntaxKind>> = OnceLock::new();
+    let map = MAP.get_or_init(|| {
+        let mut m: HashMap<&'static str, SyntaxKind> = HashMap::with_capacity(320);
+        macro_rules! ins {
+            ($($n:ident),* $(,)?) => { $(m.insert(stringify!($n), A::$n);)* }
+        }
+        ins!(
+            // Punctuation
+            DOLLAR,
+            SEMICOLON,
+            COMMA,
+            L_PAREN,
+            R_PAREN,
+            L_CURLY,
+            R_CURLY,
+            L_BRACK,
+            R_BRACK,
+            L_ANGLE,
+            R_ANGLE,
+            AT,
+            POUND,
+            TILDE,
+            QUESTION,
+            AMP,
+            PIPE,
+            PLUS,
+            STAR,
+            SLASH,
+            CARET,
+            PERCENT,
+            UNDERSCORE,
+            DOT,
+            DOT2,
+            DOT3,
+            DOT2EQ,
+            COLON,
+            COLON2,
+            EQ,
+            EQ2,
+            FAT_ARROW,
+            BANG,
+            NEQ,
+            MINUS,
+            THIN_ARROW,
+            LTEQ,
+            GTEQ,
+            PLUSEQ,
+            MINUSEQ,
+            PIPEEQ,
+            AMPEQ,
+            CARETEQ,
+            SLASHEQ,
+            STAREQ,
+            PERCENTEQ,
+            AMP2,
+            PIPE2,
+            SHL,
+            SHR,
+            SHLEQ,
+            SHREQ,
+            // Strict keywords
+            SELF_TYPE_KW,
+            ABSTRACT_KW,
+            AS_KW,
+            BECOME_KW,
+            BOX_KW,
+            BREAK_KW,
+            CONST_KW,
+            CONTINUE_KW,
+            CRATE_KW,
+            DO_KW,
+            ELSE_KW,
+            ENUM_KW,
+            EXTERN_KW,
+            FALSE_KW,
+            FINAL_KW,
+            FN_KW,
+            FOR_KW,
+            IF_KW,
+            IMPL_KW,
+            IN_KW,
+            LET_KW,
+            LOOP_KW,
+            MACRO_KW,
+            MATCH_KW,
+            MOD_KW,
+            MOVE_KW,
+            MUT_KW,
+            OVERRIDE_KW,
+            PRIV_KW,
+            PUB_KW,
+            REF_KW,
+            RETURN_KW,
+            SELF_KW,
+            STATIC_KW,
+            STRUCT_KW,
+            SUPER_KW,
+            TRAIT_KW,
+            TRUE_KW,
+            TYPE_KW,
+            TYPEOF_KW,
+            UNSAFE_KW,
+            UNSIZED_KW,
+            USE_KW,
+            VIRTUAL_KW,
+            WHERE_KW,
+            WHILE_KW,
+            YIELD_KW,
+            // Contextual keywords
+            ASM_KW,
+            ASYNC_KW,
+            ATT_SYNTAX_KW,
+            AUTO_KW,
+            BUILTIN_KW,
+            CLOBBER_ABI_KW,
+            DEFAULT_KW,
+            DYN_KW,
+            FORMAT_ARGS_KW,
+            GEN_KW,
+            GLOBAL_ASM_KW,
+            LABEL_KW,
+            MACRO_RULES_KW,
+            NAKED_ASM_KW,
+            OFFSET_OF_KW,
+            OPTIONS_KW,
+            PRESERVES_FLAGS_KW,
+            PURE_KW,
+            RAW_KW,
+            READONLY_KW,
+            SAFE_KW,
+            SYM_KW,
+            TRY_KW,
+            UNION_KW,
+            YEET_KW,
+            // Literals
+            BYTE,
+            BYTE_STRING,
+            CHAR,
+            C_STRING,
+            FLOAT_NUMBER,
+            INT_NUMBER,
+            STRING,
+            // Trivia / special tokens
+            COMMENT,
+            ERROR,
+            FRONTMATTER,
+            IDENT,
+            LIFETIME_IDENT,
+            NEWLINE,
+            SHEBANG,
+            WHITESPACE,
+            TOMBSTONE,
+            // Composite node kinds
+            ABI,
+            ARG_LIST,
+            ARRAY_EXPR,
+            ARRAY_TYPE,
+            ASM_CLOBBER_ABI,
+            ASM_CONST,
+            ASM_DIR_SPEC,
+            ASM_EXPR,
+            ASM_LABEL,
+            ASM_OPERAND_EXPR,
+            ASM_OPERAND_NAMED,
+            ASM_OPTION,
+            ASM_OPTIONS,
+            ASM_REG_OPERAND,
+            ASM_REG_SPEC,
+            ASM_SYM,
+            ASSOC_ITEM_LIST,
+            ASSOC_TYPE_ARG,
+            ATTR,
+            AWAIT_EXPR,
+            BECOME_EXPR,
+            BIN_EXPR,
+            BLOCK_EXPR,
+            BOX_PAT,
+            BREAK_EXPR,
+            CALL_EXPR,
+            CAST_EXPR,
+            CLOSURE_EXPR,
+            CONST,
+            CONST_ARG,
+            CONST_BLOCK_PAT,
+            CONST_PARAM,
+            CONTINUE_EXPR,
+            DYN_TRAIT_TYPE,
+            ENUM,
+            EXPR_STMT,
+            EXTERN_BLOCK,
+            EXTERN_CRATE,
+            EXTERN_ITEM_LIST,
+            FIELD_EXPR,
+            FN,
+            FN_PTR_TYPE,
+            FOR_BINDER,
+            FOR_EXPR,
+            FOR_TYPE,
+            FORMAT_ARGS_ARG,
+            FORMAT_ARGS_ARG_NAME,
+            FORMAT_ARGS_EXPR,
+            GENERIC_ARG_LIST,
+            GENERIC_PARAM_LIST,
+            IDENT_PAT,
+            IF_EXPR,
+            IMPL,
+            IMPL_TRAIT_TYPE,
+            INDEX_EXPR,
+            INFER_TYPE,
+            ITEM_LIST,
+            LABEL,
+            LET_ELSE,
+            LET_EXPR,
+            LET_STMT,
+            LIFETIME,
+            LIFETIME_ARG,
+            LIFETIME_PARAM,
+            LITERAL,
+            LITERAL_PAT,
+            LOOP_EXPR,
+            MACRO_CALL,
+            MACRO_DEF,
+            MACRO_EXPR,
+            MACRO_ITEMS,
+            MACRO_PAT,
+            MACRO_RULES,
+            MACRO_STMTS,
+            MACRO_TYPE,
+            MATCH_ARM,
+            MATCH_ARM_LIST,
+            MATCH_EXPR,
+            MATCH_GUARD,
+            META,
+            METHOD_CALL_EXPR,
+            MODULE,
+            NAME,
+            NAME_REF,
+            NEVER_TYPE,
+            OFFSET_OF_EXPR,
+            OR_PAT,
+            PARAM,
+            PARAM_LIST,
+            PAREN_EXPR,
+            PAREN_PAT,
+            PAREN_TYPE,
+            PARENTHESIZED_ARG_LIST,
+            PATH,
+            PATH_EXPR,
+            PATH_PAT,
+            PATH_SEGMENT,
+            PATH_TYPE,
+            PREFIX_EXPR,
+            PTR_TYPE,
+            RANGE_EXPR,
+            RANGE_PAT,
+            RECORD_EXPR,
+            RECORD_EXPR_FIELD,
+            RECORD_EXPR_FIELD_LIST,
+            RECORD_FIELD,
+            RECORD_FIELD_LIST,
+            RECORD_PAT,
+            RECORD_PAT_FIELD,
+            RECORD_PAT_FIELD_LIST,
+            REF_EXPR,
+            REF_PAT,
+            REF_TYPE,
+            RENAME,
+            REST_PAT,
+            RET_TYPE,
+            RETURN_EXPR,
+            RETURN_TYPE_SYNTAX,
+            SELF_PARAM,
+            SLICE_PAT,
+            SLICE_TYPE,
+            SOURCE_FILE,
+            STATIC,
+            STMT_LIST,
+            STRUCT,
+            TOKEN_TREE,
+            TRAIT,
+            TRAIT_ALIAS,
+            TRY_BLOCK_MODIFIER,
+            TRY_EXPR,
+            TUPLE_EXPR,
+            TUPLE_FIELD,
+            TUPLE_FIELD_LIST,
+            TUPLE_PAT,
+            TUPLE_STRUCT_PAT,
+            TUPLE_TYPE,
+            TYPE_ALIAS,
+            TYPE_ANCHOR,
+            TYPE_ARG,
+            TYPE_BOUND,
+            TYPE_BOUND_LIST,
+            TYPE_PARAM,
+            UNDERSCORE_EXPR,
+            UNION,
+            USE,
+            USE_BOUND_GENERIC_ARGS,
+            USE_TREE,
+            USE_TREE_LIST,
+            VARIANT,
+            VARIANT_LIST,
+            VISIBILITY,
+            WHERE_CLAUSE,
+            WHERE_PRED,
+            WHILE_EXPR,
+            WILDCARD_PAT,
+            YEET_EXPR,
+            YIELD_EXPR,
+        );
+        m
+    });
+    let s = format!("{k:?}");
+    map.get(s.as_str()).copied().unwrap_or(SyntaxKind::ERROR)
+}
+
+/// Recursively serialise a `ra_ap_syntax::SyntaxNode` into a [`RawNode`],
+/// preserving the full CST including whitespace and comment tokens.
+fn build_raw_node(node: &ra_ap_syntax::SyntaxNode) -> RawNode {
+    RawNode {
+        kind: convert_kind(node.kind()),
+        range: to_api_range(node.text_range()),
+        children: node
+            .children_with_tokens()
+            .map(|child| match child {
+                SyntaxElement::Node(n) => SyntaxChild::Node(build_raw_node(&n)),
+                SyntaxElement::Token(t) => SyntaxChild::Token(RawToken {
+                    kind: convert_kind(t.kind()),
+                    text: t.text().to_string(),
+                    range: to_api_range(t.text_range()),
+                }),
+            })
+            .collect(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cargo manifest builder
+// ---------------------------------------------------------------------------
+
+fn build_manifest(meta: &cargo_metadata::Metadata) -> WorkspaceManifest {
+    let members: Vec<PackageManifest> = meta
+        .workspace_packages()
+        .iter()
+        .map(|pkg| {
+            let mut deps = Vec::new();
+            let mut dev_deps = Vec::new();
+            let mut build_deps = Vec::new();
+
+            for dep in &pkg.dependencies {
+                let converted = convert_dependency(dep);
+                match dep.kind {
+                    CargoDep::Normal => deps.push(converted),
+                    CargoDep::Development => dev_deps.push(converted),
+                    CargoDep::Build => build_deps.push(converted),
+                    _ => deps.push(converted),
+                }
+            }
+
+            let features: HashMap<String, Vec<String>> = pkg
+                .features
+                .iter()
+                .map(|(k, v): (&String, &Vec<String>)| (k.clone(), v.clone()))
+                .collect();
+
+            PackageManifest {
+                name: pkg.name.clone(),
+                version: pkg.version.to_string(),
+                edition: pkg.edition.to_string(),
+                authors: pkg.authors.clone(),
+                description: pkg.description.clone(),
+                license: pkg.license.clone(),
+                repository: pkg.repository.clone(),
+                dependencies: deps,
+                dev_dependencies: dev_deps,
+                build_dependencies: build_deps,
+                features,
+                metadata: pkg.metadata.clone(),
+            }
+        })
+        .collect();
+
+    WorkspaceManifest {
+        members,
+        workspace_root: meta.workspace_root.to_string().replace('\\', "/"),
+        target_directory: meta.target_directory.to_string().replace('\\', "/"),
+        metadata: meta.workspace_metadata.clone(),
+    }
+}
+
+fn convert_dependency(dep: &cargo_metadata::Dependency) -> Dependency {
+    let source = if let Some(path) = &dep.path {
+        DependencySource::Path {
+            path: path.to_string().replace('\\', "/"),
+        }
+    } else {
+        match dep.source.as_deref() {
+            Some(s) if s.starts_with("git+") => DependencySource::Git {
+                url: s.to_string(),
+                rev: None,
+            },
+            Some(_) => DependencySource::Registry,
+            None => DependencySource::Unknown,
+        }
+    };
+
+    Dependency {
+        name: dep.name.clone(),
+        rename: dep.rename.clone(),
+        req: dep.req.to_string(),
+        features: dep.features.clone(),
+        optional: dep.optional,
+        default_features: dep.uses_default_features,
+        source,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File-tree builder
+// ---------------------------------------------------------------------------
+
+fn build_file_tree(files: &[ApiFileContext]) -> DirNode {
+    let mut root = DirNode {
+        name: String::new(),
+        path: String::new(),
+        entries: Vec::new(),
+    };
+    for file in files {
+        let parts: Vec<&str> = file.path.split('/').collect();
+        insert_into_tree(&mut root, &parts, &file.path);
+    }
+    sort_dir(&mut root);
+    root
+}
+
+fn insert_into_tree(dir: &mut DirNode, remaining: &[&str], full_path: &str) {
+    if remaining.is_empty() {
+        return;
+    }
+    if remaining.len() == 1 {
+        dir.entries.push(FsEntry::File(FileRef {
+            name: remaining[0].to_string(),
+            path: full_path.to_string(),
+        }));
+        return;
+    }
+
+    let dir_name = remaining[0];
+    let existing_idx = dir
+        .entries
+        .iter()
+        .position(|e| matches!(e, FsEntry::Dir(d) if d.name == dir_name));
+
+    let idx = if let Some(i) = existing_idx {
+        i
+    } else {
+        let dir_path = if dir.path.is_empty() {
+            dir_name.to_string()
+        } else {
+            format!("{}/{}", dir.path, dir_name)
+        };
+        dir.entries.push(FsEntry::Dir(DirNode {
+            name: dir_name.to_string(),
+            path: dir_path,
+            entries: Vec::new(),
+        }));
+        dir.entries.len() - 1
+    };
+
+    if let FsEntry::Dir(subdir) = &mut dir.entries[idx] {
+        insert_into_tree(subdir, &remaining[1..], full_path);
+    }
+}
+
+fn sort_dir(dir: &mut DirNode) {
+    dir.entries.sort_by(|a, b| {
+        let name_a = match a {
+            FsEntry::Dir(d) => d.name.as_str(),
+            FsEntry::File(f) => f.name.as_str(),
+        };
+        let name_b = match b {
+            FsEntry::Dir(d) => d.name.as_str(),
+            FsEntry::File(f) => f.name.as_str(),
+        };
+        name_a.cmp(name_b)
+    });
+    for entry in &mut dir.entries {
+        if let FsEntry::Dir(subdir) = entry {
+            sort_dir(subdir);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AST → API type converters  (typed helper fields on FileContext)
+// ---------------------------------------------------------------------------
+
 #[inline]
 fn to_api_range(r: ra_ap_syntax::TextRange) -> ApiTextRange {
     ApiTextRange {
@@ -317,10 +829,6 @@ fn to_api_range(r: ra_ap_syntax::TextRange) -> ApiTextRange {
     }
 }
 
-/// Extract every `let` binding in `syntax` (all scopes, flattened).
-///
-/// Only simple identifier patterns (`let [mut] name [: T] = …`) are captured;
-/// destructuring patterns are skipped.
 fn extract_let_bindings(
     syntax: &ra_ap_syntax::SyntaxNode,
     pat_types: &HashMap<(u32, u32), String>,
@@ -341,7 +849,6 @@ fn extract_let_bindings(
             _ => continue,
         };
 
-        // Skip anonymous / underscore patterns.
         if name.is_empty() || name == "_" {
             continue;
         }
@@ -371,10 +878,6 @@ fn extract_let_bindings(
     bindings
 }
 
-/// Build an [`FnDef`] from an `ast::Fn` node.
-///
-/// Returns `None` if the function has no name (shouldn't happen in valid
-/// Rust, but defensive programming is cheap here).
 fn extract_fn_def(fn_node: &ast::Fn) -> Option<FnDef> {
     let name = fn_node.name()?.to_string();
 
@@ -427,7 +930,6 @@ fn extract_fn_def(fn_node: &ast::Fn) -> Option<FnDef> {
     })
 }
 
-/// Extract all function definitions in `syntax` (top-level and impl methods).
 fn extract_functions(syntax: &ra_ap_syntax::SyntaxNode) -> Vec<FnDef> {
     syntax
         .descendants()
@@ -436,7 +938,6 @@ fn extract_functions(syntax: &ra_ap_syntax::SyntaxNode) -> Vec<FnDef> {
         .collect()
 }
 
-/// Extract named fields from a `RecordFieldList`.
 fn extract_record_fields(list: &ast::RecordFieldList) -> Vec<FieldDef> {
     list.fields()
         .filter_map(|f| {
@@ -454,7 +955,6 @@ fn extract_record_fields(list: &ast::RecordFieldList) -> Vec<FieldDef> {
         .collect()
 }
 
-/// Extract positional fields from a `TupleFieldList`, naming them by index.
 fn extract_tuple_fields(list: &ast::TupleFieldList) -> Vec<FieldDef> {
     list.fields()
         .enumerate()
@@ -476,7 +976,6 @@ fn extract_tuple_fields(list: &ast::TupleFieldList) -> Vec<FieldDef> {
         .collect()
 }
 
-/// Extract all struct definitions in `syntax`.
 fn extract_structs(syntax: &ra_ap_syntax::SyntaxNode) -> Vec<StructDef> {
     syntax
         .descendants()
@@ -487,7 +986,6 @@ fn extract_structs(syntax: &ra_ap_syntax::SyntaxNode) -> Vec<StructDef> {
                 .visibility()
                 .map(|v| v.syntax().text().to_string().starts_with("pub"))
                 .unwrap_or(false);
-
             let (fields, tuple_fields) = match s.field_list() {
                 Some(ast::FieldList::RecordFieldList(list)) => {
                     (extract_record_fields(&list), vec![])
@@ -495,7 +993,6 @@ fn extract_structs(syntax: &ra_ap_syntax::SyntaxNode) -> Vec<StructDef> {
                 Some(ast::FieldList::TupleFieldList(list)) => (vec![], extract_tuple_fields(&list)),
                 None => (vec![], vec![]),
             };
-
             Some(StructDef {
                 name,
                 fields,
@@ -507,7 +1004,6 @@ fn extract_structs(syntax: &ra_ap_syntax::SyntaxNode) -> Vec<StructDef> {
         .collect()
 }
 
-/// Extract all enum definitions in `syntax`.
 fn extract_enums(syntax: &ra_ap_syntax::SyntaxNode) -> Vec<EnumDef> {
     syntax
         .descendants()
@@ -518,7 +1014,6 @@ fn extract_enums(syntax: &ra_ap_syntax::SyntaxNode) -> Vec<EnumDef> {
                 .visibility()
                 .map(|v| v.syntax().text().to_string().starts_with("pub"))
                 .unwrap_or(false);
-
             let variants: Vec<VariantDef> = e
                 .variant_list()
                 .map(|vl| {
@@ -543,7 +1038,6 @@ fn extract_enums(syntax: &ra_ap_syntax::SyntaxNode) -> Vec<EnumDef> {
                         .collect()
                 })
                 .unwrap_or_default();
-
             Some(EnumDef {
                 name,
                 variants,
@@ -554,10 +1048,6 @@ fn extract_enums(syntax: &ra_ap_syntax::SyntaxNode) -> Vec<EnumDef> {
         .collect()
 }
 
-/// Extract all `impl` blocks in `syntax`.
-///
-/// Methods are also included in the file-level `functions` list for flat
-/// iteration; the `ImplDef` gives the structural view.
 fn extract_impls(syntax: &ra_ap_syntax::SyntaxNode) -> Vec<ImplDef> {
     syntax
         .descendants()
@@ -566,11 +1056,9 @@ fn extract_impls(syntax: &ra_ap_syntax::SyntaxNode) -> Vec<ImplDef> {
             let self_ty = impl_node
                 .self_ty()
                 .map(|t| t.syntax().text().to_string().trim().to_owned())?;
-
             let trait_ = impl_node
                 .trait_()
                 .map(|t| t.syntax().text().to_string().trim().to_owned());
-
             let methods: Vec<FnDef> = impl_node
                 .assoc_item_list()
                 .map(|list| {
@@ -585,7 +1073,6 @@ fn extract_impls(syntax: &ra_ap_syntax::SyntaxNode) -> Vec<ImplDef> {
                         .collect()
                 })
                 .unwrap_or_default();
-
             Some(ImplDef {
                 self_ty,
                 trait_,
@@ -600,8 +1087,6 @@ fn extract_impls(syntax: &ra_ap_syntax::SyntaxNode) -> Vec<ImplDef> {
 // Module file collector
 // ---------------------------------------------------------------------------
 
-/// Recursively collect the `EditionedFileId` of every module in the subtree
-/// rooted at `module`, deduplicating via the plain `FileId`.
 fn collect_module_files(
     db: &RootDatabase,
     module: &ra_ap_hir::Module,
@@ -618,4 +1103,3 @@ fn collect_module_files(
         collect_module_files(db, &child, seen, queue);
     }
 }
-

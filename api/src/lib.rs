@@ -52,8 +52,11 @@
 //! ```
 
 mod context;
+pub mod manifest;
 mod plugin;
 mod replacement;
+pub mod syntax;
+pub mod tree;
 
 // Re-export everything so plugin authors only need `use forgen_api::*;`
 // (or cherry-pick individual names).
@@ -62,8 +65,10 @@ pub use context::{
     EnumDef, FieldDef, FileContext, FnDef, FnParam, ImplDef, LetBinding, StructDef, VariantDef,
     WorkspaceContext,
 };
+pub use manifest::{Dependency, DependencySource, PackageManifest, WorkspaceManifest};
 pub use plugin::Plugin;
 pub use replacement::{FileReplacement, Replacement, TextRange};
+pub use tree::{DirNode, FileRef, FsEntry};
 
 // Re-export serde_json so the `plugin_export!` macro can reference it as
 // `::serde_json::…` without requiring plugin crates to add their own
