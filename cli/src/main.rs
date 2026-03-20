@@ -1,5 +1,4 @@
 mod loader;
-mod plugins;
 mod workspace;
 
 use anyhow::{Context, Result};
@@ -102,6 +101,10 @@ fn main() -> Result<()> {
         loop {
             match rx.recv() {
                 Ok(Ok(events)) => {
+                    // Collect every .rs path that was touched — this covers
+                    // creates, deletes, renames, and plain modifications since
+                    // notify-debouncer-mini collapses all of them into a single
+                    // path-level event.
                     let changed_files: Vec<_> = events
                         .iter()
                         .filter(|e| e.path.extension().and_then(|s| s.to_str()) == Some("rs"))
@@ -109,7 +112,41 @@ fn main() -> Result<()> {
                         .collect();
 
                     if !changed_files.is_empty() {
-                        println!("🔄 File change detected, re-running plugins...");
+                        // Summarise what happened so the user knows why a
+                        // re-run was triggered (created / deleted / modified).
+                        let created: Vec<_> = changed_files
+                            .iter()
+                            .filter(|p| {
+                                // A file that exists now but the VFS doesn't
+                                // know about yet is effectively "new".
+                                p.exists()
+                            })
+                            .collect();
+                        let deleted: Vec<_> =
+                            changed_files.iter().filter(|p| !p.exists()).collect();
+
+                        if !created.is_empty() {
+                            for p in &created {
+                                println!(
+                                    "  📝 {}",
+                                    p.file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("(unknown)")
+                                );
+                            }
+                        }
+                        if !deleted.is_empty() {
+                            for p in &deleted {
+                                println!(
+                                    "  🗑  {}",
+                                    p.file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("(unknown)")
+                                );
+                            }
+                        }
+
+                        println!("🔄 File system change detected, re-running plugins...");
                         match workspace::apply_file_changes(&mut host, &mut vfs, &changed_files) {
                             Ok(_) => match run_plugins(&host, &vfs, &workspace_info) {
                                 Ok(_) => println!("✅ Done\n"),
@@ -146,23 +183,13 @@ fn run_plugins(
     let project_dir = &workspace_info.root;
     let cargo_meta = &workspace_info.cargo_metadata;
 
-    // Built-in plugins.
-    let mut plugins: Vec<Box<dyn Plugin>> = vec![Box::new(plugins::f64_logger::F64LoggerPlugin)];
+    // Plugins come entirely from the plugin suite — no built-ins.
+    let mut plugins: Vec<Box<dyn Plugin>> = Vec::new();
 
-    // Dylib plugins from `forgen-plugins/` directory (manual drop-in).
-    let dylib_dir = project_dir.join("forgen-plugins");
-    if dylib_dir.exists() {
-        plugins.extend(loader::load_plugins_from_dir(&dylib_dir));
-    }
-
-    // Workspace-metadata plugins: `[workspace.metadata.forgen] plugins = [...]`
-    let workspace_plugins = loader::load_workspace_plugins(cargo_meta);
-    if !workspace_plugins.is_empty() {
-        println!(
-            "  📦 Loaded {} workspace plugin(s)\n",
-            workspace_plugins.len()
-        );
-        plugins.extend(workspace_plugins);
+    // Plugin suite: `[workspace.metadata.forgen] suite = "..."`
+    if let Some(suite) = loader::load_suite(cargo_meta) {
+        println!();
+        plugins.push(suite);
     }
 
     let sema = Semantics::new(db);
@@ -250,6 +277,11 @@ fn build_workspace_context(
 ) -> Result<WorkspaceContext> {
     let mut files: Vec<ApiFileContext> = Vec::new();
 
+    // Normalise the workspace root to a forward-slash string once so we can
+    // do reliable prefix stripping even on Windows where VFS paths may carry
+    // the `\\?\` extended-path prefix while `project_dir` does not.
+    let root_norm = normalize_path_str(&project_dir.to_string_lossy());
+
     for editioned_id in file_queue {
         let file_id = editioned_id.file_id();
 
@@ -281,11 +313,12 @@ fn build_workspace_context(
             }
         }
 
-        let rel_path = path
-            .strip_prefix(project_dir)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel_path = {
+            let p = normalize_path_str(&path.to_string_lossy());
+            p.strip_prefix(&root_norm)
+                .map(|s| s.trim_start_matches('/').to_owned())
+                .unwrap_or(p)
+        };
 
         // Build the full serialisable CST (includes all trivia/comments).
         let tree = build_raw_node(syntax);
@@ -306,11 +339,30 @@ fn build_workspace_context(
     let file_tree = build_file_tree(&files);
 
     Ok(WorkspaceContext {
-        workspace_root: project_dir.to_string_lossy().replace('\\', "/"),
+        workspace_root: root_norm,
         manifest,
         file_tree,
         files,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Path helpers
+// ---------------------------------------------------------------------------
+
+/// Collapse backslashes to forward slashes and strip the Windows extended-path
+/// prefix (`\\?\` or `\\?\UNC\`) so that two paths referring to the same
+/// location always compare equal as strings.
+fn normalize_path_str(raw: &str) -> String {
+    let s = raw.replace('\\', "/");
+    // Strip \\?\ (becomes //?/ after backslash replacement)
+    if let Some(rest) = s.strip_prefix("//?/UNC/") {
+        return format!("//{}", rest);
+    }
+    if let Some(rest) = s.strip_prefix("//?/") {
+        return rest.to_owned();
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------

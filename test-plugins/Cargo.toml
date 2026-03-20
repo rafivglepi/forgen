@@ -1,0 +1,12 @@
+[package]
+name = "test-plugins"
+version = "0.1.0"
+edition = "2021"
+description = "Example Forgen plugin suite for the forgen development workspace. Defines its own plugins inline — no extra crate needed."
+
+[lib]
+name = "test_plugins"
+crate-type = ["cdylib"]
+
+[dependencies]
+forgen-api = { path = "../api" }

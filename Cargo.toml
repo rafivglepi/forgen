@@ -1,7 +1,14 @@
 [workspace]
-members = ["api", "cli", "example-plugin", "test"]
+members = ["api", "cli", "test", "test-plugins"]
 
 resolver = "2"
 
 [workspace.metadata.forgen]
-plugins = ["example-plugin"]
+# Name of the workspace member crate that acts as the plugin suite.
+# This crate is compiled as a cdylib and loaded by cargo-forgen at runtime.
+#
+# Convention: if you name your plugin suite crate "plugins" you don't need
+# this entry at all — cargo-forgen will discover it automatically.
+#
+# Change this to whatever you named your plugin suite crate:
+suite = "test-plugins"

@@ -2,21 +2,13 @@ use crate::{FileReplacement, WorkspaceContext};
 
 /// Implemented by every Forgen plugin.
 ///
-/// The Forgen runtime calls [`Plugin::run`] **once per invocation** with the
-/// complete [`WorkspaceContext`] and collects the returned [`FileReplacement`]
-/// list. Plugins may freely cross-reference files and return replacements for
-/// any number of files in a single call.
+/// Plugin crates are plain Rust library crates (`rlib`) — they implement
+/// this trait and are called directly (no FFI, no serialisation) by the
+/// suite crate that the user writes for their workspace.
 ///
-/// # Built-in vs. dynamic plugins
-///
-/// Plugins can be used in two ways:
-///
-/// 1. **Built-in** — compiled directly into `cargo-forgen`. Implement this
-///    trait and register the plugin in the runner. Useful during development.
-///
-/// 2. **Dynamic (dylib)** — compiled as a `cdylib` crate and placed in the
-///    `forgen-plugins/` directory of the workspace. Use the [`plugin_export!`]
-///    macro to generate the required C-ABI entry points.
+/// Only the suite crate itself is compiled as a `cdylib`; it uses
+/// [`plugin_suite!`] to expose the single C entry-point that the
+/// Forgen CLI loads.
 pub trait Plugin: Send + Sync {
     /// Human-readable name used in log output and error messages.
     fn name(&self) -> &str;
@@ -29,113 +21,116 @@ pub trait Plugin: Send + Sync {
     ///   fully supported.
     /// - Return one [`FileReplacement`] per file that should be modified.
     ///   Files that need no changes should simply be omitted.
-    /// - The runner applies replacements in **reverse offset order**, so
-    ///   plugins do not need to account for position shifts caused by
-    ///   earlier insertions in the same file.
+    /// - The runner applies replacements in **reverse offset order** so
+    ///   plugins do not need to account for position shifts from earlier
+    ///   insertions in the same file.
     /// - Returning an empty `Vec` is valid and means "no changes".
     fn run(&self, ctx: &WorkspaceContext) -> Vec<FileReplacement>;
 }
 
-/// Generates the C-ABI entry points required for a dynamically-loaded Forgen
-/// plugin (a `cdylib` crate).
+/// Generates the three C-ABI entry points required for a Forgen suite
+/// `cdylib` crate.
 ///
-/// The plugin type must implement both [`Plugin`] and [`Default`].
-/// `Default` is used to construct the plugin on each invocation; if your
-/// plugin requires configuration, read it from the [`WorkspaceContext`] or
-/// from environment variables / files inside [`Plugin::run`].
+/// The single argument is any expression that, when called with
+/// `&WorkspaceContext`, returns `Vec<FileReplacement>`.  In practice this is
+/// either a plain function name or a closure that fans out to multiple plugin
+/// crates.
 ///
 /// # Generated symbols
 ///
-/// | Symbol                  | Signature                                       |
-/// |-------------------------|-------------------------------------------------|
-/// | `forgen_plugin_name`    | `extern "C" fn() -> *const c_char`              |
-/// | `forgen_run`            | `extern "C" fn(*const c_char) -> *mut c_char`   |
-/// | `forgen_free`           | `unsafe extern "C" fn(*mut c_char)`             |
+/// | Symbol                | Signature                                                      |
+/// |-----------------------|----------------------------------------------------------------|
+/// | `forgen_abi_version`  | `extern "C" fn() -> u64`                                      |
+/// | `forgen_run`          | `unsafe extern "C" fn(*const WorkspaceContext) -> *mut Vec<FileReplacement>` |
+/// | `forgen_free`         | `unsafe extern "C" fn(*mut Vec<FileReplacement>)`             |
 ///
-/// `forgen_run` accepts a JSON-encoded [`WorkspaceContext`] and returns a
-/// JSON-encoded `Vec<FileReplacement>`. The caller (the Forgen runtime) is
-/// responsible for freeing the returned pointer with `forgen_free`.
+/// `forgen_run` receives a raw pointer to the `WorkspaceContext` that lives
+/// on the CLI's stack and returns a `Box`-backed pointer to the result.  The
+/// CLI frees it with `Box::from_raw`; both sides must use the system
+/// allocator (no custom `#[global_allocator]`).
+///
+/// # Safety requirements
+///
+/// - Both the CLI binary and the suite dylib must be compiled with the
+///   same version of `forgen-api` (the CLI checks [`FORGEN_ABI_VERSION`]
+///   before calling anything else).
+/// - Neither the CLI nor the suite crate may override the global
+///   allocator; both use the system `malloc`/`free` so cross-boundary
+///   deallocation is safe.
 ///
 /// # Example
 ///
 /// ```rust,no_run
-/// // In your cdylib plugin crate (Cargo.toml: crate-type = ["cdylib"])
-/// use forgen_api::{plugin_export, FileReplacement, Plugin, WorkspaceContext};
+/// // forgen-suite/src/lib.rs
+/// use forgen_api::{plugin_suite, FileReplacement, Plugin, WorkspaceContext};
+/// use my_plugin::MyPlugin;
+/// use another_plugin::AnotherPlugin;
 ///
-/// #[derive(Default)]
-/// pub struct MyPlugin;
+/// plugin_suite!(|ctx: &WorkspaceContext| {
+///     let mut out = Vec::new();
+///     out.extend(MyPlugin.run(ctx));
+///     out.extend(AnotherPlugin.run(ctx));
+///     out
+/// });
+/// ```
 ///
-/// impl Plugin for MyPlugin {
-///     fn name(&self) -> &str {
-///         "my-plugin"
-///     }
+/// Or with a named function:
 ///
-///     fn run(&self, ctx: &WorkspaceContext) -> Vec<FileReplacement> {
-///         // Inspect ctx.files, build replacements …
-///         vec![]
-///     }
+/// ```rust,no_run
+/// use forgen_api::{plugin_suite, FileReplacement, Plugin, WorkspaceContext};
+/// use my_plugin::MyPlugin;
+///
+/// fn run(ctx: &WorkspaceContext) -> Vec<FileReplacement> {
+///     MyPlugin.run(ctx)
 /// }
 ///
-/// plugin_export!(MyPlugin, "my-plugin");
+/// plugin_suite!(run);
 /// ```
+///
+/// [`FORGEN_ABI_VERSION`]: crate::FORGEN_ABI_VERSION
 #[macro_export]
-macro_rules! plugin_export {
-    ($plugin_type:ty, $name:literal) => {
-        /// Returns the null-terminated plugin name as a static C string.
-        ///
-        /// The returned pointer has `'static` lifetime and must **not** be freed.
+macro_rules! plugin_suite {
+    ($run_fn:expr) => {
+        /// Returns the `forgen-api` ABI version this suite was
+        /// compiled against.  The CLI aborts the load if the value does not
+        /// match its own compile-time constant.
         #[no_mangle]
-        pub extern "C" fn forgen_plugin_name() -> *const ::std::os::raw::c_char {
-            // Safety: the string literal has a trailing null byte, is valid
-            // UTF-8, and lives for the duration of the program.
-            concat!($name, "\0").as_ptr() as *const ::std::os::raw::c_char
+        pub extern "C" fn forgen_abi_version() -> u64 {
+            $crate::FORGEN_ABI_VERSION
         }
 
-        /// Accepts a JSON-encoded [`WorkspaceContext`], runs the plugin, and
-        /// returns a JSON-encoded `Vec<FileReplacement>`.
-        ///
-        /// The caller must pass the returned pointer to [`forgen_free`] when
-        /// done. Panics (rather than returning null) on serialization errors so
-        /// that bugs surface loudly during development.
-        #[no_mangle]
-        pub extern "C" fn forgen_run(
-            ctx_json: *const ::std::os::raw::c_char,
-        ) -> *mut ::std::os::raw::c_char {
-            // Safety: the caller guarantees `ctx_json` is a valid,
-            // null-terminated UTF-8 C string for the duration of this call.
-            let ctx_str = unsafe {
-                ::std::ffi::CStr::from_ptr(ctx_json)
-                    .to_str()
-                    .expect("forgen_run: ctx_json is not valid UTF-8")
-            };
-
-            let ctx: $crate::WorkspaceContext = $crate::serde_json::from_str(ctx_str)
-                .expect("forgen_run: failed to deserialise WorkspaceContext");
-
-            let plugin = <$plugin_type as ::std::default::Default>::default();
-            let result = $crate::Plugin::run(&plugin, &ctx);
-
-            let json = $crate::serde_json::to_string(&result)
-                .expect("forgen_run: failed to serialise Vec<FileReplacement>");
-
-            ::std::ffi::CString::new(json)
-                .expect("forgen_run: serialised result contains an interior null byte")
-                .into_raw()
-        }
-
-        /// Frees a pointer previously returned by [`forgen_run`].
+        /// Runs all plugins registered in this suite.
         ///
         /// # Safety
         ///
-        /// - `ptr` must have been obtained from a call to [`forgen_run`].
-        /// - `ptr` must not have been freed already.
+        /// `__ctx` must be a valid, non-null pointer to a `WorkspaceContext`
+        /// that remains valid for the entire duration of this call.  The
+        /// returned pointer is a `Box`-backed heap allocation; the caller
+        /// must eventually pass it to [`forgen_free`].
+        #[no_mangle]
+        pub unsafe extern "C" fn forgen_run(
+            __ctx: *const $crate::WorkspaceContext,
+        ) -> *mut ::std::vec::Vec<$crate::FileReplacement> {
+            // Safety: the CLI guarantees __ctx is a valid reference for the
+            // duration of this call.
+            let __ctx_ref: &$crate::WorkspaceContext = unsafe { &*__ctx };
+            let __result: ::std::vec::Vec<$crate::FileReplacement> = ($run_fn)(__ctx_ref);
+            ::std::boxed::Box::into_raw(::std::boxed::Box::new(__result))
+        }
+
+        /// Frees a `Vec<FileReplacement>` previously returned by
+        /// [`forgen_run`].
+        ///
+        /// # Safety
+        ///
+        /// - `__ptr` must have been returned by a call to [`forgen_run`].
+        /// - `__ptr` must not have been freed already.
         /// - Passing `null` is safe and is a no-op.
         #[no_mangle]
-        pub unsafe extern "C" fn forgen_free(ptr: *mut ::std::os::raw::c_char) {
-            if !ptr.is_null() {
-                // Reconstruct the CString and let it drop, which frees the
-                // memory that was allocated by `CString::into_raw`.
-                drop(::std::ffi::CString::from_raw(ptr));
+        pub unsafe extern "C" fn forgen_free(__ptr: *mut ::std::vec::Vec<$crate::FileReplacement>) {
+            if !__ptr.is_null() {
+                // Reconstruct the Box so it is properly deallocated.
+                drop(::std::boxed::Box::from_raw(__ptr));
             }
         }
     };

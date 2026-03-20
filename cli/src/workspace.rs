@@ -106,22 +106,36 @@ pub fn apply_file_changes(
     changed_files: &[PathBuf],
 ) -> Result<()> {
     for file_path in changed_files {
-        vfs.set_file_contents(
-            VfsPath::from(
-                AbsPathBuf::try_from(
-                    file_path
-                        .canonicalize()?
-                        .to_str()
-                        .ok_or_else(|| anyhow::anyhow!("Path is not valid UTF-8"))?,
-                )
-                .map_err(|e| anyhow::anyhow!("Invalid path: {:?}", e))?,
-            ),
+        // Resolve to an absolute path.  For deleted files `canonicalize()`
+        // fails, so we fall back to making it absolute via the current dir.
+        let abs_path = if file_path.exists() {
+            file_path.canonicalize()?
+        } else {
+            std::env::current_dir()?.join(file_path)
+        };
+
+        let vfs_path = VfsPath::from(
+            AbsPathBuf::try_from(
+                abs_path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("Path is not valid UTF-8"))?,
+            )
+            .map_err(|e| anyhow::anyhow!("Invalid path: {:?}", e))?,
+        );
+
+        // If the file still exists, update its contents; if it was deleted or
+        // moved away, pass `None` so the VFS removes it from the database.
+        let contents = if file_path.exists() {
             Some(
                 fs::read_to_string(file_path)
                     .with_context(|| format!("Failed to read file: {:?}", file_path))?
                     .into_bytes(),
-            ),
-        );
+            )
+        } else {
+            None
+        };
+
+        vfs.set_file_contents(vfs_path, contents);
     }
 
     let vfs_changes = vfs.take_changes();

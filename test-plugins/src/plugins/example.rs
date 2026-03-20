@@ -1,4 +1,8 @@
-//! Example Forgen dylib plugin.
+//! Inline example plugin for the `test-plugins` plugin suite.
+//!
+//! This module contains the same logic that used to live in the standalone
+//! `example-plugin` crate, but is now embedded directly inside the plugin suite
+//! crate.  No separate workspace member is needed.
 //!
 //! This plugin demonstrates the full plugin API:
 //!   - Reading workspace manifest data (package names, editions, dependencies)
@@ -8,29 +12,16 @@
 //!
 //! It does not modify any files — it just prints an analysis report to stderr
 //! so you can verify it loaded and received the workspace context correctly.
-//!
-//! # How to use
-//!
-//! 1. Add this crate to your workspace's `Cargo.toml`:
-//!    ```toml
-//!    [workspace.metadata.forgen]
-//!    plugins = ["example-plugin"]
-//!    ```
-//! 2. Make sure the crate is a workspace member.
-//! 3. Run `cargo forgen` — it will build and load this plugin automatically.
 
 use forgen_api::syntax::raw::{Child, RawNode};
 use forgen_api::syntax::SyntaxKind;
-use forgen_api::{
-    plugin_export, DirNode, FileReplacement, FsEntry, Plugin, TextRange, WorkspaceContext,
-};
+use forgen_api::{DirNode, FileReplacement, FsEntry, Plugin, TextRange, WorkspaceContext};
 
 // ---------------------------------------------------------------------------
 // Plugin declaration
 // ---------------------------------------------------------------------------
 
-/// The example plugin struct.  `Default` is required by `plugin_export!`.
-#[derive(Default)]
+/// The example plugin struct.
 pub struct ExamplePlugin;
 
 impl Plugin for ExamplePlugin {
@@ -112,9 +103,6 @@ impl Plugin for ExamplePlugin {
         vec![]
     }
 }
-
-// Export the C-ABI entry points so the Forgen runtime can load this dylib.
-plugin_export!(ExamplePlugin, "example-plugin");
 
 // ---------------------------------------------------------------------------
 // File-tree printer

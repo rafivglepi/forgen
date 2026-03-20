@@ -67,6 +67,34 @@ pub use context::{
 };
 pub use manifest::{Dependency, DependencySource, PackageManifest, WorkspaceManifest};
 pub use plugin::Plugin;
+
+/// Compile-time FNV-1a hash of a byte string.
+///
+/// Used to derive [`FORGEN_ABI_VERSION`] from the crate's Cargo version
+/// string so that the constant never needs to be bumped by hand.
+const fn fnv1a(s: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    let mut i = 0;
+    while i < s.len() {
+        hash ^= s[i] as u64;
+        hash = hash.wrapping_mul(0x00000100000001b3);
+        i += 1;
+    }
+    hash
+}
+
+/// ABI version of `forgen-api`, automatically derived from the crate's
+/// `Cargo.toml` version string via a compile-time FNV-1a hash.
+///
+/// Both the CLI and the suite dylib embed this constant at compile
+/// time.  Before the CLI passes any pointers into the dylib it checks that
+/// the two values match; a mismatch means the suite was built against
+/// a different release of `forgen-api` and the load is aborted with a clear
+/// error message.
+///
+/// **You never need to bump this by hand.** Incrementing the `[package]
+/// version` in `forgen-api/Cargo.toml` changes the hash automatically.
+pub const FORGEN_ABI_VERSION: u64 = fnv1a(env!("CARGO_PKG_VERSION").as_bytes());
 pub use replacement::{FileReplacement, Replacement, TextRange};
 pub use tree::{DirNode, FileRef, FsEntry};
 
