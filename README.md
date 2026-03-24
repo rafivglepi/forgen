@@ -2,17 +2,24 @@
 
 Developer tool for compile-time codegen in Rust, filling the blanks between macros and build.
 
-Forgen is a global macros system, where you import plugins—whether linters, syntax extensions, or type-aware macros—, and they apply to your codebase with a small snippet at the top of your files:
-
-```rust
-#![forgen]
-use forgen::forgen
-```
+Forgen writes plugin-generated replacements to `target/.forgen/<mirrored-path>.json`, and a proc macro applies them during compilation.
 
 ## Usage
 
-At the start of every file you want to use Forgen in, import the forgen::forgen macro and use it globally with `#![forgen]`
-Before building, run `cargo forgen` to refresh the Forgen metadata, and while coding, run `cargo forgen --watch` to use hot reloading
+Add this to each crate root file you want Forgen to apply to:
+
+```rust
+#![feature(custom_inner_attributes, prelude_import)]
+#![forgen::file("test/src/lib.rs")]
+```
+
+Notes:
+
+- `#![forgen::file("...")]` is a custom inner attribute, so this currently requires nightly.
+- The path must be the workspace-relative path to the current file.
+- `#![feature(custom_inner_attributes, prelude_import)]` must be enabled in the crate attributes.
+- Before building, run `cargo forgen` to refresh the generated replacement files.
+- While coding, run `cargo forgen --watch` to keep `target/.forgen/` up to date.
 
 ## Development
 

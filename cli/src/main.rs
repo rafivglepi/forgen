@@ -1,9 +1,11 @@
 mod loader;
+mod replacements;
 mod workspace;
 
 use anyhow::{Context, Result};
 use cargo_metadata::DependencyKind as CargoDep;
 use clap::{Parser, Subcommand};
+use forgen_api::Replacement;
 use forgen_api::{
     syntax::raw::{Child as SyntaxChild, RawNode, RawToken},
     syntax::SyntaxKind,
@@ -18,7 +20,7 @@ use ra_ap_paths::AbsPathBuf;
 use ra_ap_syntax::{ast, ast::HasName, ast::HasVisibility, AstNode, Edition, SyntaxElement};
 use ra_ap_vfs::Vfs;
 use std::collections::{HashMap, HashSet};
-use std::fs;
+
 use std::path::PathBuf;
 use std::sync::{mpsc::channel, OnceLock};
 use std::time::Duration;
@@ -214,48 +216,44 @@ fn run_plugins(
     println!("🧩 Running {} plugin(s)...\n", plugins.len());
 
     let mut total_changes: usize = 0;
+    let mut replacements_by_path: HashMap<String, Vec<Replacement>> = HashMap::new();
 
     for plugin in &plugins {
         let file_replacements = plugin.run(&workspace_ctx);
 
-        for mut fr in file_replacements {
+        for fr in file_replacements {
             if fr.replacements.is_empty() {
                 continue;
             }
 
-            fr.replacements.sort_by_key(|r| r.range.start);
-
-            let rel_path = std::path::Path::new(&fr.path);
-            let output_dir = project_dir.join("target").join(".forgen").join(
-                rel_path
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new("")),
-            );
-            fs::create_dir_all(&output_dir)?;
-
-            let mut output_name = rel_path.file_name().unwrap_or_default().to_os_string();
-            output_name.push(".json");
-            let output_path = output_dir.join(output_name);
-
-            let json = serde_json::to_string_pretty(&fr.replacements)?;
-            fs::write(&output_path, &json)?;
-
             println!(
-                "  💾 {} → {} replacement(s)  [{}]",
+                "  🧩 {} → {} replacement(s)  [{}]",
                 fr.path,
                 fr.replacements.len(),
                 plugin.name(),
             );
             total_changes += fr.replacements.len();
+            replacements_by_path
+                .entry(fr.path)
+                .or_default()
+                .extend(fr.replacements);
         }
     }
 
+    let total_saved = replacements::write_saved_replacements(
+        project_dir,
+        &workspace_ctx.files,
+        &replacements_by_path,
+    )?;
+
     println!();
-    if total_changes > 0 {
+    if total_saved > 0 {
         println!(
-            "✅ Saved {} total replacement(s) to target/.forgen/",
-            total_changes
+            "✅ Saved {} total replacement patch(es) to target/.forgen/",
+            total_saved
         );
+    } else if total_changes > 0 {
+        println!("✅ Replacements were generated, but all serialised patch sets were empty");
     } else {
         println!("✅ No replacements generated");
     }

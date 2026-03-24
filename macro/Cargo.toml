@@ -1,0 +1,13 @@
+[package]
+name = "forgen"
+version = "0.1.0"
+edition = "2021"
+description = "Proc-macro crate for applying Forgen-generated replacements at compile time."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+syn = { version = "2.0", features = ["parsing"] }

@@ -19,29 +19,29 @@
 
 "use strict";
 
-const fs   = require("fs");
+const fs = require("fs");
 const path = require("path");
 
 // ---------------------------------------------------------------------------
 // CLI flags
 // ---------------------------------------------------------------------------
 
-const args     = process.argv.slice(2);
-const DIFF     = args.includes("--diff");
+const args = process.argv.slice(2);
+const DIFF = args.includes("--diff");
 const NO_COLOR = args.includes("--no-color") || !process.stdout.isTTY;
-const targets  = args.filter(a => !a.startsWith("--"));
+const targets = args.filter((a) => !a.startsWith("--"));
 
 // ---------------------------------------------------------------------------
 // Colour helpers
 // ---------------------------------------------------------------------------
 
 const c = {
-  reset:  NO_COLOR ? "" : "\x1b[0m",
-  bold:   NO_COLOR ? "" : "\x1b[1m",
-  dim:    NO_COLOR ? "" : "\x1b[2m",
-  green:  NO_COLOR ? "" : "\x1b[32m",
-  red:    NO_COLOR ? "" : "\x1b[31m",
-  cyan:   NO_COLOR ? "" : "\x1b[36m",
+  reset: NO_COLOR ? "" : "\x1b[0m",
+  bold: NO_COLOR ? "" : "\x1b[1m",
+  dim: NO_COLOR ? "" : "\x1b[2m",
+  green: NO_COLOR ? "" : "\x1b[32m",
+  red: NO_COLOR ? "" : "\x1b[31m",
+  cyan: NO_COLOR ? "" : "\x1b[36m",
   yellow: NO_COLOR ? "" : "\x1b[33m",
 };
 
@@ -67,7 +67,9 @@ function findWorkspaceRoot(startDir) {
       try {
         const content = fs.readFileSync(toml, "utf8");
         if (content.includes("[workspace]")) return dir;
-      } catch (_) { /* ignore */ }
+      } catch (_) {
+        /* ignore */
+      }
     }
     const parent = path.dirname(dir);
     if (parent === dir) return null; // reached filesystem root
@@ -80,30 +82,114 @@ function findWorkspaceRoot(startDir) {
 // ---------------------------------------------------------------------------
 
 /**
- * Apply an array of replacements to `source`.
+ * Find the byte offset of the nth occurrence of `needle` in `source`.
  *
- * Replacements are sorted by `range.start` in descending order so that
- * applying one replacement does not shift the offsets of earlier ones.
+ * Occurrences are zero-based and count overlapping matches.
+ * Empty-string matches are counted at every UTF-8 character boundary.
+ */
+function findOccurrenceStart(source, needle, index) {
+  if (!Number.isInteger(index) || index < 0) return null;
+
+  if (needle === "") {
+    let seen = 0;
+    for (let i = 0; i <= source.length; i++) {
+      if (i === 0 || i === source.length || isCharBoundary(source, i)) {
+        if (seen === index) return i;
+        seen++;
+      }
+    }
+    return null;
+  }
+
+  let seen = 0;
+  for (let i = 0; i + needle.length <= source.length; i++) {
+    if (!isCharBoundary(source, i)) continue;
+    if (source.startsWith(needle, i)) {
+      if (seen === index) return i;
+      seen++;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Return whether `offset` is a UTF-16 code unit boundary that is safe to use
+ * as a string slice boundary in JS without splitting a surrogate pair.
+ */
+function isCharBoundary(source, offset) {
+  if (offset <= 0 || offset >= source.length) return true;
+  const prev = source.charCodeAt(offset - 1);
+  const next = source.charCodeAt(offset);
+  const prevIsHigh = prev >= 0xd800 && prev <= 0xdbff;
+  const nextIsLow = next >= 0xdc00 && next <= 0xdfff;
+  return !(prevIsHigh && nextIsLow);
+}
+
+/**
+ * Resolve occurrence-based replacements into byte ranges within `source`.
  *
  * Each replacement object must have the shape:
- *   { range: { start: number, end: number }, text: string }
+ *   { index: number, old_text: string, new_text: string }
  */
-function applyReplacements(source, replacements) {
-  const sorted = [...replacements].sort((a, b) => b.range.start - a.range.start);
+function resolveReplacements(source, replacements) {
+  const resolved = [];
 
-  let result = source;
-  for (const rep of sorted) {
-    const { start, end } = rep.range;
+  for (const rep of replacements) {
+    const { index, old_text, new_text } = rep;
 
-    if (start < 0 || end < start || end > result.length) {
+    if (typeof index !== "number" || index < 0 || !Number.isInteger(index)) {
       console.warn(
-        `${c.yellow}  ⚠  Skipping out-of-bounds replacement ` +
-        `[${start}..${end}] (file length ${result.length})${c.reset}`
+        `${c.yellow}  ⚠  Skipping replacement with invalid index: ${JSON.stringify(rep)}${c.reset}`,
       );
       continue;
     }
 
-    result = result.slice(0, start) + rep.text + result.slice(end);
+    if (typeof old_text !== "string" || typeof new_text !== "string") {
+      console.warn(
+        `${c.yellow}  ⚠  Skipping replacement with invalid text fields: ${JSON.stringify(rep)}${c.reset}`,
+      );
+      continue;
+    }
+
+    const start = findOccurrenceStart(source, old_text, index);
+    if (start == null) {
+      console.warn(
+        `${c.yellow}  ⚠  Could not find occurrence #${index} of ${JSON.stringify(old_text)}${c.reset}`,
+      );
+      continue;
+    }
+
+    const end = start + old_text.length;
+    resolved.push({ start, end, text: new_text, old_text, index });
+  }
+
+  return resolved;
+}
+
+/**
+ * Apply an array of occurrence-based replacements to `source`.
+ *
+ * Resolved replacements are applied in descending order by start offset so that
+ * later edits do not shift the positions of earlier ones.
+ */
+function applyReplacements(source, replacements) {
+  const resolved = resolveReplacements(source, replacements);
+  const sorted = [...resolved].sort((a, b) => b.start - a.start);
+
+  let result = source;
+  for (const rep of sorted) {
+    const { start, end, text } = rep;
+
+    if (start < 0 || end < start || end > result.length) {
+      console.warn(
+        `${c.yellow}  ⚠  Skipping out-of-bounds replacement ` +
+          `[${start}..${end}] (file length ${result.length})${c.reset}`,
+      );
+      continue;
+    }
+
+    result = result.slice(0, start) + text + result.slice(end);
   }
 
   return result;
@@ -127,7 +213,9 @@ function unifiedDiff(before, after, filePath) {
 
   // Build a simple line-by-line comparison using a naive LCS.
   const lcs = buildLCS(oldLines, newLines);
-  let oi = 0, ni = 0, li = 0;
+  let oi = 0,
+    ni = 0,
+    li = 0;
   let hunkLines = [];
   let inHunk = false;
 
@@ -150,16 +238,27 @@ function unifiedDiff(before, after, filePath) {
       // Context line — only show 2 lines of context around changes.
       if (inHunk) {
         hunkLines.push(`${c.dim} ${oldLines[oi]}${c.reset}`);
-        if (hunkLines.filter(l => l.startsWith(c.red) || l.startsWith(c.green)).length === 0) {
+        if (
+          hunkLines.filter((l) => l.startsWith(c.red) || l.startsWith(c.green))
+            .length === 0
+        ) {
           hunkLines = [];
         }
       }
-      oi++; ni++; li++;
-    } else if (ni < newLines.length && (li >= lcs.length || newLines[ni] !== lcs[li])) {
+      oi++;
+      ni++;
+      li++;
+    } else if (
+      ni < newLines.length &&
+      (li >= lcs.length || newLines[ni] !== lcs[li])
+    ) {
       inHunk = true;
       hunkLines.push(`${c.green}+${newLines[ni]}${c.reset}`);
       ni++;
-    } else if (oi < oldLines.length && (li >= lcs.length || oldLines[oi] !== lcs[li])) {
+    } else if (
+      oi < oldLines.length &&
+      (li >= lcs.length || oldLines[oi] !== lcs[li])
+    ) {
       inHunk = true;
       hunkLines.push(`${c.red}-${oldLines[oi]}${c.reset}`);
       oi++;
@@ -180,18 +279,23 @@ function buildLCS(a, b) {
 
   for (let i = 1; i <= m; i++) {
     for (let j = 1; j <= n; j++) {
-      dp[i][j] = a[i - 1] === b[j - 1]
-        ? dp[i - 1][j - 1] + 1
-        : Math.max(dp[i - 1][j], dp[i][j - 1]);
+      dp[i][j] =
+        a[i - 1] === b[j - 1]
+          ? dp[i - 1][j - 1] + 1
+          : Math.max(dp[i - 1][j], dp[i][j - 1]);
     }
   }
 
   // Backtrack.
   const result = [];
-  let i = m, j = n;
+  let i = m,
+    j = n;
   while (i > 0 && j > 0) {
-    if (a[i - 1] === b[j - 1]) { result.push(a[i - 1]); i--; j--; }
-    else if (dp[i - 1][j] > dp[i][j - 1]) i--;
+    if (a[i - 1] === b[j - 1]) {
+      result.push(a[i - 1]);
+      i--;
+      j--;
+    } else if (dp[i - 1][j] > dp[i][j - 1]) i--;
     else j--;
   }
   return result.reverse();
@@ -215,13 +319,18 @@ function processFile(sourceFile, workspaceRoot) {
 
   // Normalise to forward slashes for display / JSON lookup.
   const relPath = path.relative(workspaceRoot, absSource).replace(/\\/g, "/");
-  const jsonPath = path.join(workspaceRoot, "target", ".forgen", relPath + ".json");
+  const jsonPath = path.join(
+    workspaceRoot,
+    "target",
+    ".forgen",
+    relPath + ".json",
+  );
 
   if (!fs.existsSync(jsonPath)) {
     console.log(
       `${c.yellow}⚠  No replacement file for ${relPath}${c.reset}\n` +
-      `   (expected: target/.forgen/${relPath}.json)\n` +
-      `   Run ${c.bold}cargo forgen${c.reset} first.`
+        `   (expected: target/.forgen/${relPath}.json)\n` +
+        `   Run ${c.bold}cargo forgen${c.reset} first.`,
     );
     return false;
   }
@@ -230,12 +339,33 @@ function processFile(sourceFile, workspaceRoot) {
   try {
     replacements = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
   } catch (e) {
-    console.error(`${c.red}❌  Failed to parse ${jsonPath}: ${e.message}${c.reset}`);
+    console.error(
+      `${c.red}❌  Failed to parse ${jsonPath}: ${e.message}${c.reset}`,
+    );
     return false;
   }
 
   if (!Array.isArray(replacements)) {
-    console.error(`${c.red}❌  ${jsonPath} does not contain a JSON array${c.reset}`);
+    console.error(
+      `${c.red}❌  ${jsonPath} does not contain a JSON array${c.reset}`,
+    );
+    return false;
+  }
+
+  if (
+    replacements.some(
+      (rep) =>
+        !rep ||
+        typeof rep !== "object" ||
+        typeof rep.index !== "number" ||
+        typeof rep.old_text !== "string" ||
+        typeof rep.new_text !== "string",
+    )
+  ) {
+    console.error(
+      `${c.red}❌  ${jsonPath} does not contain occurrence-based replacements ` +
+        `{ index, old_text, new_text }${c.reset}`,
+    );
     return false;
   }
 
@@ -244,32 +374,49 @@ function processFile(sourceFile, workspaceRoot) {
   console.log(header(relPath));
   console.log(
     `${c.bold}${replacements.length}${c.reset} replacement(s) from ` +
-    `${c.dim}target/.forgen/${relPath}.json${c.reset}`
+      `${c.dim}target/.forgen/${relPath}.json${c.reset}`,
   );
   console.log();
 
   // Print replacement summary table.
+  const resolved = resolveReplacements(source, replacements);
   for (let i = 0; i < replacements.length; i++) {
     const rep = replacements[i];
-    const { start, end } = rep.range;
-    const kind =
-      start === end ? "insert" :
-      rep.text === "" ? "delete" : "replace";
+    const resolvedRep = resolved[i];
 
-    const preview = rep.text
+    const kind = !resolvedRep
+      ? "invalid"
+      : resolvedRep.start === resolvedRep.end
+        ? "insert"
+        : resolvedRep.text === ""
+          ? "delete"
+          : "replace";
+
+    const preview = String(rep.new_text ?? "")
       .replace(/\n/g, "↵")
       .replace(/\t/g, "→")
       .slice(0, 60);
 
     const kindColor =
-      kind === "insert"  ? c.green :
-      kind === "delete"  ? c.red   : c.yellow;
+      kind === "insert"
+        ? c.green
+        : kind === "delete"
+          ? c.red
+          : kind === "invalid"
+            ? c.yellow
+            : c.yellow;
+
+    const location = resolvedRep
+      ? `@ ${c.bold}[${resolvedRep.start}..${resolvedRep.end}]${c.reset}`
+      : `${c.yellow}(unresolved)${c.reset}`;
 
     console.log(
       `  ${c.dim}[${String(i + 1).padStart(2)}]${c.reset} ` +
-      `${kindColor}${kind.padEnd(7)}${c.reset} ` +
-      `@ ${c.bold}[${start}..${end}]${c.reset}` +
-      (rep.text ? `  ${c.dim}"${preview}${rep.text.length > 60 ? "…" : ""}"${c.reset}` : "")
+        `${kindColor}${kind.padEnd(7)}${c.reset} ` +
+        `#${rep.index} ${c.dim}${JSON.stringify(rep.old_text)}${c.reset} ${location}` +
+        (rep.new_text
+          ? `  ${c.dim}"${preview}${rep.new_text.length > 60 ? "…" : ""}"${c.reset}`
+          : ""),
     );
   }
 
@@ -320,7 +467,7 @@ const workspaceRoot = findWorkspaceRoot(process.cwd());
 if (!workspaceRoot) {
   console.error(
     `${c.red}❌  Could not find a workspace root (Cargo.toml with [workspace]).${c.reset}\n` +
-    `   Run this script from inside your Cargo workspace.`
+      `   Run this script from inside your Cargo workspace.`,
   );
   process.exit(1);
 }
@@ -344,7 +491,7 @@ if (targets.length > 0) {
   if (!fs.existsSync(forgenDir)) {
     console.error(
       `\n${c.red}❌  target/.forgen/ not found.${c.reset}\n` +
-      `   Run ${c.bold}cargo forgen${c.reset} first to generate replacement files.`
+        `   Run ${c.bold}cargo forgen${c.reset} first to generate replacement files.`,
     );
     process.exit(1);
   }
@@ -352,7 +499,7 @@ if (targets.length > 0) {
   walkDir(forgenDir, (jsonFile) => {
     // Reconstruct the source path by stripping the forgenDir prefix and
     // the trailing ".json" suffix.
-    const relJson   = path.relative(forgenDir, jsonFile);
+    const relJson = path.relative(forgenDir, jsonFile);
     const relSource = relJson.replace(/\.json$/, "");
     const sourceFile = path.join(workspaceRoot, relSource);
 
@@ -361,7 +508,7 @@ if (targets.length > 0) {
       if (processFile(sourceFile, workspaceRoot)) ok++;
     } else {
       console.warn(
-        `${c.yellow}⚠  JSON found but source missing: ${relSource}${c.reset}`
+        `${c.yellow}⚠  JSON found but source missing: ${relSource}${c.reset}`,
       );
     }
   });
@@ -369,9 +516,11 @@ if (targets.length > 0) {
 
 console.log(
   `\n${ok === processed ? c.green : c.yellow}` +
-  `✔  Processed ${ok}/${processed} file(s).${c.reset}\n`
+    `✔  Processed ${ok}/${processed} file(s).${c.reset}\n`,
 );
 
 if (ok === 0 && processed === 0) {
-  console.log(`${c.dim}No replacement files found. Run ${c.bold}cargo forgen${c.reset}${c.dim} first.${c.reset}`);
+  console.log(
+    `${c.dim}No replacement files found. Run ${c.bold}cargo forgen${c.reset}${c.dim} first.${c.reset}`,
+  );
 }

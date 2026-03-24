@@ -1,5 +1,5 @@
 [workspace]
-members = ["api", "cli", "test", "test-plugins"]
+members = ["api", "cli", "macro", "test", "test-plugins"]
 
 resolver = "2"
 

@@ -1,3 +1,5 @@
+#![feature(custom_inner_attributes, prelude_import)]
+#![forgen::file("test/src/lib.rs")]
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

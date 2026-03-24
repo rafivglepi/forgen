@@ -1,3 +1,5 @@
+#![feature(custom_inner_attributes, prelude_import)]
+#![forgen::file("test/src/main.rs")]
 #![allow(dead_code, unused_variables, unused_mut)]
 use forgen_tests::{distance, midpoint, Point};
 use serde::{Deserialize, Serialize};
