@@ -25,7 +25,7 @@ impl Plugin for F64LoggerPlugin {
                 let insert_at = binding.range.end;
 
                 // Replicate the indentation of the line that contains the `let`.
-                let indent = leading_indent(&file.source, insert_at);
+                let indent = leading_indent(file.source(), insert_at);
 
                 replacements.push(Replacement::insert(
                     insert_at,
@@ -57,4 +57,3 @@ fn leading_indent(source: &str, offset: u32) -> String {
         .take_while(|c| *c == ' ' || *c == '\t')
         .collect()
 }
-

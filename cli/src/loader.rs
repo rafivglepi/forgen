@@ -3,6 +3,7 @@ use forgen_api::{FileReplacement, Plugin, WorkspaceContext, FORGEN_ABI_VERSION};
 use libloading::{Library, Symbol};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 // ---------------------------------------------------------------------------
 // Raw-pointer ABI types
@@ -202,6 +203,7 @@ pub fn load_suite(meta: &cargo_metadata::Metadata) -> Option<Box<dyn Plugin>> {
     let target_dir: &Path = meta.target_directory.as_std_path();
 
     println!("  🔨 Building plugin suite '{suite_name}'...");
+    let build_start = Instant::now();
 
     // Build the plugin suite crate as a cdylib.
     // We suppress output on the first attempt; if the build fails we re-run
@@ -214,7 +216,12 @@ pub fn load_suite(meta: &cargo_metadata::Metadata) -> Option<Box<dyn Plugin>> {
         .status();
 
     match silent_status {
-        Ok(s) if s.success() => { /* all good */ }
+        Ok(s) if s.success() => {
+            println!(
+                "  ⏱ plugin suite build finished in {:.2?}",
+                build_start.elapsed()
+            );
+        }
         Ok(_) => {
             eprintln!(
                 "  ⚠️  `cargo build --package {suite_name}` failed — \
@@ -243,12 +250,17 @@ pub fn load_suite(meta: &cargo_metadata::Metadata) -> Option<Box<dyn Plugin>> {
         return None;
     };
 
+    let load_start = Instant::now();
     match unsafe { PluginSuite::load(&dylib_path) } {
         Ok(p) => {
             println!(
                 "  ✅ Loaded plugin suite '{}' from {}",
                 p.name(),
                 dylib_path.display()
+            );
+            println!(
+                "  ⏱ plugin suite dylib load took {:.2?}",
+                load_start.elapsed()
             );
             Some(Box::new(p))
         }

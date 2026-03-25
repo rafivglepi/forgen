@@ -10,20 +10,23 @@ use forgen_api::{
     syntax::raw::{Child as SyntaxChild, RawNode, RawToken},
     syntax::SyntaxKind,
     Dependency, DependencySource, DirNode, EnumDef, FieldDef, FileContext as ApiFileContext,
-    FileRef, FnDef, FnParam, FsEntry, ImplDef, LetBinding, PackageManifest, Plugin, StructDef,
-    TextRange as ApiTextRange, VariantDef, WorkspaceContext, WorkspaceManifest,
+    FileRef, FnDef, FnParam, FsEntry, ImplDef, LazyValue, LetBinding, PackageManifest, Plugin,
+    StructDef, TextRange as ApiTextRange, VariantDef, WorkspaceContext, WorkspaceManifest,
 };
 use notify_debouncer_mini::{new_debouncer, notify::*};
-use ra_ap_hir::{Crate, HirDisplay, Semantics};
-use ra_ap_ide_db::{base_db::SourceDatabase, EditionedFileId, FileId, RootDatabase};
+use ra_ap_hir::{HirDisplay, Semantics};
+use ra_ap_ide_db::{base_db::SourceDatabase, EditionedFileId, RootDatabase};
 use ra_ap_paths::AbsPathBuf;
-use ra_ap_syntax::{ast, ast::HasName, ast::HasVisibility, AstNode, Edition, SyntaxElement};
+use ra_ap_syntax::{
+    ast, ast::HasName, ast::HasVisibility, AstNode, Edition, SourceFile, SyntaxElement,
+};
 use ra_ap_vfs::Vfs;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::marker::PhantomData;
 
 use std::path::PathBuf;
 use std::sync::{mpsc::channel, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -52,6 +55,22 @@ struct Args {
     /// Watch for file changes and re-run plugins (development mode)
     #[arg(short, long)]
     watch: bool,
+
+    /// Disable rust-analyzer proc-macro expansion while loading the workspace
+    #[arg(long)]
+    no_proc_macros: bool,
+
+    /// Disable eager inferred-type collection for unannotated `let` bindings
+    #[arg(long)]
+    no_inferred_let_types: bool,
+
+    /// Re-enable build-script / out-dir loading while loading the workspace
+    #[arg(long)]
+    with_build_scripts: bool,
+
+    /// Re-enable rust-analyzer cache prefill while loading the workspace
+    #[arg(long)]
+    with_prefill_caches: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -68,6 +87,8 @@ fn main() -> Result<()> {
     let manifest_path = args.manifest.unwrap_or_else(|| PathBuf::from("Cargo.toml"));
     println!("📦 Loading project: {}", manifest_path.display());
 
+    let total_start = Instant::now();
+
     let manifest_path_abs = manifest_path.canonicalize()?;
     let manifest_path_str = manifest_path_abs
         .to_str()
@@ -75,14 +96,51 @@ fn main() -> Result<()> {
     let manifest_path = AbsPathBuf::try_from(manifest_path_str)
         .map_err(|e| anyhow::anyhow!("Invalid path: {:?}", e))?;
 
+    let metadata_start = Instant::now();
     let workspace_info = workspace::get_workspace_info(&manifest_path_abs)?;
-    let (mut host, mut vfs) = workspace::load_workspace(&manifest_path)?;
+    println!(
+        "⏱ cargo metadata + workspace discovery took {:.2?}",
+        metadata_start.elapsed()
+    );
+
+    let load_start = Instant::now();
+    println!(
+        "🧪 Workspace load config: proc_macros={}, build_scripts={}, prefill_caches={}",
+        if args.no_proc_macros {
+            "disabled"
+        } else {
+            "sysroot"
+        },
+        if args.with_build_scripts {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if args.with_prefill_caches {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    );
+    let (mut host, mut vfs) = workspace::load_workspace(
+        &manifest_path,
+        workspace::WorkspaceLoadOptions {
+            proc_macro_server: if args.no_proc_macros {
+                ra_ap_load_cargo::ProcMacroServerChoice::None
+            } else {
+                ra_ap_load_cargo::ProcMacroServerChoice::Sysroot
+            },
+            load_out_dirs_from_check: args.with_build_scripts,
+            prefill_caches: args.with_prefill_caches,
+        },
+    )?;
+    println!("⏱ workspace load took {:.2?}", load_start.elapsed());
 
     if args.watch {
         println!("👀 Watch mode enabled - monitoring for changes...\n");
         println!("Press Ctrl+C to stop\n");
 
-        run_plugins(&host, &vfs, &workspace_info)?;
+        run_plugins(&host, &vfs, &workspace_info, !args.no_inferred_let_types)?;
 
         let (tx, rx) = channel();
         let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
@@ -150,7 +208,12 @@ fn main() -> Result<()> {
 
                         println!("🔄 File system change detected, re-running plugins...");
                         match workspace::apply_file_changes(&mut host, &mut vfs, &changed_files) {
-                            Ok(_) => match run_plugins(&host, &vfs, &workspace_info) {
+                            Ok(_) => match run_plugins(
+                                &host,
+                                &vfs,
+                                &workspace_info,
+                                !args.no_inferred_let_types,
+                            ) {
                                 Ok(_) => println!("✅ Done\n"),
                                 Err(e) => eprintln!("❌ Plugin error: {}\n", e),
                             },
@@ -166,7 +229,10 @@ fn main() -> Result<()> {
             }
         }
     } else {
-        run_plugins(&host, &vfs, &workspace_info)?;
+        let run_start = Instant::now();
+        run_plugins(&host, &vfs, &workspace_info, !args.no_inferred_let_types)?;
+        println!("⏱ plugin run took {:.2?}", run_start.elapsed());
+        println!("⏱ total CLI time {:.2?}", total_start.elapsed());
         println!("\n✨ Done!");
     }
 
@@ -181,7 +247,9 @@ fn run_plugins(
     db: &RootDatabase,
     vfs: &Vfs,
     workspace_info: &workspace::WorkspaceInfo,
+    collect_inferred_let_types: bool,
 ) -> Result<()> {
+    let run_start = Instant::now();
     let project_dir = &workspace_info.root;
     let cargo_meta = &workspace_info.cargo_metadata;
 
@@ -189,38 +257,88 @@ fn run_plugins(
     let mut plugins: Vec<Box<dyn Plugin>> = Vec::new();
 
     // Plugin suite: `[workspace.metadata.forgen] suite = "..."`
+    let suite_start = Instant::now();
     if let Some(suite) = loader::load_suite(cargo_meta) {
         println!();
         plugins.push(suite);
     }
+    println!("⏱ plugin suite load took {:.2?}", suite_start.elapsed());
 
+    println!("⏱ entering semantics init");
     let sema = Semantics::new(db);
+    println!("⏱ finished semantics init");
+    println!("⏱ about to call Crate::all");
 
-    // Enumerate source files.
-    let mut seen: HashSet<FileId> = HashSet::new();
+    // Enumerate source files directly from the VFS instead of walking the HIR
+    // module graph. This is much cheaper on large workspaces and avoids the
+    // expensive recursive `module.children()` traversal.
+    let enumerate_start = Instant::now();
     let mut file_queue: Vec<EditionedFileId> = Vec::new();
-    for krate in Crate::all(db) {
-        if krate.origin(db).is_local() {
-            collect_module_files(db, &krate.root_module(), &mut seen, &mut file_queue);
+    let mut local_vfs_file_count = 0usize;
+    let mut skipped_non_local_files = 0usize;
+    let root_norm = normalize_path_str(&project_dir.to_string_lossy());
+
+    for (file_id, vfs_path) in vfs.iter() {
+        let Some(abs_path) = vfs_path.as_path() else {
+            skipped_non_local_files += 1;
+            continue;
+        };
+
+        let path_norm = normalize_path_str(&abs_path.to_string());
+        if !path_norm.starts_with(&root_norm) || !path_norm.ends_with(".rs") {
+            skipped_non_local_files += 1;
+            continue;
         }
+
+        let editioned_id = EditionedFileId::current_edition(file_id);
+        file_queue.push(editioned_id);
+        local_vfs_file_count += 1;
     }
+
+    file_queue.sort_by_key(|id| {
+        workspace::file_id_to_path(vfs, id.file_id(), project_dir)
+            .map(|p| normalize_path_str(&p.to_string_lossy()))
+            .unwrap_or_default()
+    });
+
+    println!(
+        "⏱ direct VFS file enumeration took {:.2?} (local_rs_files={}, skipped={})",
+        enumerate_start.elapsed(),
+        local_vfs_file_count,
+        skipped_non_local_files
+    );
 
     println!(
         "🔍 Building workspace context from {} file(s)...",
         file_queue.len()
     );
 
-    let workspace_ctx =
-        build_workspace_context(&sema, db, vfs, project_dir, file_queue, cargo_meta)?;
+    let workspace_ctx_start = Instant::now();
+    let workspace_ctx = build_workspace_context(
+        &sema,
+        db,
+        vfs,
+        project_dir,
+        file_queue,
+        cargo_meta,
+        collect_inferred_let_types,
+    )?;
+    println!(
+        "⏱ workspace context build took {:.2?}",
+        workspace_ctx_start.elapsed()
+    );
 
     println!("🧩 Running {} plugin(s)...\n", plugins.len());
 
+    let plugin_exec_start = Instant::now();
     let mut total_changes: usize = 0;
     let mut replacements_by_path: HashMap<String, Vec<Replacement>> = HashMap::new();
 
     for plugin in &plugins {
+        let plugin_start = Instant::now();
         let file_replacements = plugin.run(&workspace_ctx);
 
+        let mut plugin_changes = 0usize;
         for fr in file_replacements {
             if fr.replacements.is_empty() {
                 continue;
@@ -233,18 +351,35 @@ fn run_plugins(
                 plugin.name(),
             );
             total_changes += fr.replacements.len();
+            plugin_changes += fr.replacements.len();
             replacements_by_path
                 .entry(fr.path)
                 .or_default()
                 .extend(fr.replacements);
         }
-    }
 
+        println!(
+            "⏱ plugin '{}' execution took {:.2?} ({} replacement(s))",
+            plugin.name(),
+            plugin_start.elapsed(),
+            plugin_changes
+        );
+    }
+    println!(
+        "⏱ all plugin execution took {:.2?}",
+        plugin_exec_start.elapsed()
+    );
+
+    let write_start = Instant::now();
     let total_saved = replacements::write_saved_replacements(
         project_dir,
-        &workspace_ctx.files,
+        workspace_ctx.files.as_slice(),
         &replacements_by_path,
     )?;
+    println!(
+        "⏱ replacement JSON write took {:.2?}",
+        write_start.elapsed()
+    );
 
     println!();
     if total_saved > 0 {
@@ -258,6 +393,8 @@ fn run_plugins(
         println!("✅ No replacements generated");
     }
 
+    println!("⏱ run_plugins total took {:.2?}", run_start.elapsed());
+
     Ok(())
 }
 
@@ -265,83 +402,212 @@ fn run_plugins(
 // WorkspaceContext builder
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
+struct SharedRuntime {
+    db: *const RootDatabase,
+    vfs: *const Vfs,
+    project_dir: *const PathBuf,
+    collect_inferred_let_types: bool,
+    _not_send_sync: PhantomData<fn() -> ()>,
+}
+
+unsafe impl Send for SharedRuntime {}
+unsafe impl Sync for SharedRuntime {}
+
+impl SharedRuntime {
+    fn db(self) -> &'static RootDatabase {
+        unsafe { &*self.db }
+    }
+
+    fn vfs(self) -> &'static Vfs {
+        unsafe { &*self.vfs }
+    }
+
+    fn project_dir(self) -> &'static PathBuf {
+        unsafe { &*self.project_dir }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FileRuntime {
+    shared: SharedRuntime,
+    editioned_id: EditionedFileId,
+}
+
+unsafe impl Send for FileRuntime {}
+unsafe impl Sync for FileRuntime {}
+
+impl FileRuntime {
+    fn path(self) -> Option<PathBuf> {
+        workspace::file_id_to_path(
+            self.shared.vfs(),
+            self.editioned_id.file_id(),
+            self.shared.project_dir(),
+        )
+    }
+
+    fn rel_path(self, root_norm: &str) -> Option<String> {
+        let path = self.path()?;
+        let p = normalize_path_str(&path.to_string_lossy());
+        Some(
+            p.strip_prefix(root_norm)
+                .map(|s| s.trim_start_matches('/').to_owned())
+                .unwrap_or(p),
+        )
+    }
+
+    fn source(self) -> String {
+        String::from(&*SourceDatabase::file_text(
+            self.shared.db(),
+            self.editioned_id.file_id(),
+        ))
+    }
+
+    fn syntax_from_source(self) -> ra_ap_syntax::SyntaxNode {
+        let (_file_id, edition) = self.editioned_id.unpack();
+        SourceFile::parse(&self.source(), edition)
+            .tree()
+            .syntax()
+            .clone()
+    }
+
+    fn let_bindings(self) -> Vec<LetBinding> {
+        let sema = Semantics::new(self.shared.db());
+        let parsed = sema.parse(self.editioned_id);
+        let syntax = parsed.syntax();
+        let mut pat_type_cache: HashMap<(u32, u32), String> = HashMap::new();
+
+        if self.shared.collect_inferred_let_types {
+            for node in syntax.descendants() {
+                let Some(let_stmt) = ast::LetStmt::cast(node) else {
+                    continue;
+                };
+                if let_stmt.ty().is_some() {
+                    continue;
+                }
+                let Some(pat) = let_stmt.pat() else { continue };
+                let Some(init) = let_stmt.initializer() else {
+                    continue;
+                };
+                if let Some(type_info) = sema.type_of_expr(&init) {
+                    let ty_str = type_info
+                        .original
+                        .display(self.shared.db(), Edition::CURRENT)
+                        .to_string();
+                    let r = pat.syntax().text_range();
+                    pat_type_cache.insert((u32::from(r.start()), u32::from(r.end())), ty_str);
+                }
+            }
+        }
+
+        extract_let_bindings(&syntax, &pat_type_cache)
+    }
+
+    fn tree(self) -> RawNode {
+        let syntax = self.syntax_from_source();
+        build_raw_node(&syntax)
+    }
+
+    fn functions(self) -> Vec<FnDef> {
+        let syntax = self.syntax_from_source();
+        extract_functions(&syntax)
+    }
+
+    fn structs(self) -> Vec<StructDef> {
+        let syntax = self.syntax_from_source();
+        extract_structs(&syntax)
+    }
+
+    fn enums(self) -> Vec<EnumDef> {
+        let syntax = self.syntax_from_source();
+        extract_enums(&syntax)
+    }
+
+    fn impls(self) -> Vec<ImplDef> {
+        let syntax = self.syntax_from_source();
+        extract_impls(&syntax)
+    }
+}
+
 fn build_workspace_context(
-    sema: &Semantics<RootDatabase>,
+    _sema: &Semantics<RootDatabase>,
     db: &RootDatabase,
     vfs: &Vfs,
     project_dir: &PathBuf,
     file_queue: Vec<EditionedFileId>,
     cargo_meta: &cargo_metadata::Metadata,
+    collect_inferred_let_types: bool,
 ) -> Result<WorkspaceContext> {
-    let mut files: Vec<ApiFileContext> = Vec::new();
+    let ctx_start = Instant::now();
 
-    // Normalise the workspace root to a forward-slash string once so we can
-    // do reliable prefix stripping even on Windows where VFS paths may carry
-    // the `\\?\` extended-path prefix while `project_dir` does not.
     let root_norm = normalize_path_str(&project_dir.to_string_lossy());
+    let manifest_start = Instant::now();
+    let manifest = build_manifest(cargo_meta);
+    println!("⏱ manifest build took {:.2?}", manifest_start.elapsed());
+
+    let shared = SharedRuntime {
+        db: db as *const RootDatabase,
+        vfs: vfs as *const Vfs,
+        project_dir: project_dir as *const PathBuf,
+        collect_inferred_let_types,
+        _not_send_sync: PhantomData,
+    };
+
+    let mut files: Vec<ApiFileContext> = Vec::new();
+    let mut paths_for_tree: Vec<String> = Vec::new();
+    let mut skipped_files = 0usize;
 
     for editioned_id in file_queue {
-        let file_id = editioned_id.file_id();
+        let runtime = FileRuntime {
+            shared,
+            editioned_id,
+        };
 
-        let Some(path) = workspace::file_id_to_path(vfs, file_id, project_dir) else {
+        let Some(rel_path) = runtime.rel_path(&root_norm) else {
+            skipped_files += 1;
             continue;
         };
 
-        let source = String::from(&*SourceDatabase::file_text(db, file_id));
-        let parsed = sema.parse(editioned_id);
-        let syntax = parsed.syntax();
+        paths_for_tree.push(rel_path.clone());
 
-        // Pre-compute inferred types for unannotated `let` bindings.
-        let mut pat_type_cache: HashMap<(u32, u32), String> = HashMap::new();
-        for node in syntax.descendants() {
-            let Some(let_stmt) = ast::LetStmt::cast(node) else {
-                continue;
-            };
-            if let_stmt.ty().is_some() {
-                continue;
-            }
-            let Some(pat) = let_stmt.pat() else { continue };
-            let Some(init) = let_stmt.initializer() else {
-                continue;
-            };
-            if let Some(type_info) = sema.type_of_expr(&init) {
-                let ty_str = type_info.original.display(db, Edition::CURRENT).to_string();
-                let r = pat.syntax().text_range();
-                pat_type_cache.insert((u32::from(r.start()), u32::from(r.end())), ty_str);
-            }
-        }
+        let source_runtime = runtime;
+        let tree_runtime = runtime;
+        let lets_runtime = runtime;
+        let functions_runtime = runtime;
+        let structs_runtime = runtime;
+        let enums_runtime = runtime;
+        let impls_runtime = runtime;
 
-        let rel_path = {
-            let p = normalize_path_str(&path.to_string_lossy());
-            p.strip_prefix(&root_norm)
-                .map(|s| s.trim_start_matches('/').to_owned())
-                .unwrap_or(p)
-        };
-
-        // Build the full serialisable CST (includes all trivia/comments).
-        let tree = build_raw_node(syntax);
-
-        files.push(ApiFileContext {
-            path: rel_path,
-            source,
-            tree,
-            let_bindings: extract_let_bindings(syntax, &pat_type_cache),
-            functions: extract_functions(syntax),
-            structs: extract_structs(syntax),
-            enums: extract_enums(syntax),
-            impls: extract_impls(syntax),
-        });
+        files.push(ApiFileContext::new(
+            rel_path,
+            LazyValue::new(move || source_runtime.source()),
+            LazyValue::new(move || tree_runtime.tree()),
+            LazyValue::new(move || lets_runtime.let_bindings()),
+            LazyValue::new(move || functions_runtime.functions()),
+            LazyValue::new(move || structs_runtime.structs()),
+            LazyValue::new(move || enums_runtime.enums()),
+            LazyValue::new(move || impls_runtime.impls()),
+        ));
     }
 
-    let manifest = build_manifest(cargo_meta);
-    let file_tree = build_file_tree(&files);
+    let file_tree_start = Instant::now();
+    let file_tree_paths = paths_for_tree.clone();
+    let file_tree = LazyValue::new(move || build_file_tree(&file_tree_paths));
+    println!(
+        "⏱ workspace context file handle build took {:.2?} (files={}, skipped={})",
+        file_tree_start.elapsed(),
+        files.len(),
+        skipped_files
+    );
 
-    Ok(WorkspaceContext {
-        workspace_root: root_norm,
-        manifest,
-        file_tree,
-        files,
-    })
+    println!(
+        "⏱ build_workspace_context total took {:.2?} (files={}, skipped={})",
+        ctx_start.elapsed(),
+        files.len(),
+        skipped_files
+    );
+
+    Ok(WorkspaceContext::new(root_norm, files, manifest, file_tree))
 }
 
 // ---------------------------------------------------------------------------
@@ -795,15 +1061,15 @@ fn convert_dependency(dep: &cargo_metadata::Dependency) -> Dependency {
 // File-tree builder
 // ---------------------------------------------------------------------------
 
-fn build_file_tree(files: &[ApiFileContext]) -> DirNode {
+fn build_file_tree(paths: &[String]) -> DirNode {
     let mut root = DirNode {
         name: String::new(),
         path: String::new(),
         entries: Vec::new(),
     };
-    for file in files {
-        let parts: Vec<&str> = file.path.split('/').collect();
-        insert_into_tree(&mut root, &parts, &file.path);
+    for path in paths {
+        let parts: Vec<&str> = path.split('/').collect();
+        insert_into_tree(&mut root, &parts, path);
     }
     sort_dir(&mut root);
     root
@@ -1134,22 +1400,5 @@ fn extract_impls(syntax: &ra_ap_syntax::SyntaxNode) -> Vec<ImplDef> {
 }
 
 // ---------------------------------------------------------------------------
-// Module file collector
+// VFS-backed file enumeration
 // ---------------------------------------------------------------------------
-
-fn collect_module_files(
-    db: &RootDatabase,
-    module: &ra_ap_hir::Module,
-    seen: &mut HashSet<FileId>,
-    queue: &mut Vec<EditionedFileId>,
-) {
-    if let Some(editioned_id) = module.definition_source(db).file_id.file_id() {
-        let file_id = editioned_id.file_id();
-        if seen.insert(file_id) {
-            queue.push(editioned_id);
-        }
-    }
-    for child in module.children(db) {
-        collect_module_files(db, &child, seen, queue);
-    }
-}

@@ -56,7 +56,7 @@ impl Plugin for ExamplePlugin {
 
         // ── File tree ────────────────────────────────────────────────────
         eprintln!("[example-plugin]  File tree :");
-        print_dir_tree(&ctx.file_tree, 1);
+        print_dir_tree(ctx.file_tree(), 1);
 
         // ── Per-file analysis ─────────────────────────────────────────────
         eprintln!("[example-plugin]  File analysis :");
@@ -68,7 +68,7 @@ impl Plugin for ExamplePlugin {
         let mut total_pub_fns = 0usize;
 
         for file in &ctx.files {
-            let stats = analyse_file(&file.tree);
+            let stats = analyse_file(file.tree());
 
             total_nodes += stats.nodes;
             total_tokens += stats.tokens;

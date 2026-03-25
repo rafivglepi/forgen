@@ -6,7 +6,14 @@ use ra_ap_load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice
 use ra_ap_paths::AbsPathBuf;
 use ra_ap_project_model::{CargoConfig, RustLibSource};
 use ra_ap_vfs::{Change, Vfs, VfsPath};
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{collections::HashMap, fs, path::PathBuf, time::Instant};
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceLoadOptions {
+    pub proc_macro_server: ProcMacroServerChoice,
+    pub load_out_dirs_from_check: bool,
+    pub prefill_caches: bool,
+}
 
 pub struct WorkspaceInfo {
     pub root: PathBuf,
@@ -47,7 +54,42 @@ pub fn get_workspace_info(manifest_path: &PathBuf) -> Result<WorkspaceInfo> {
     })
 }
 
-pub fn load_workspace(manifest_path: &AbsPathBuf) -> Result<(RootDatabase, Vfs)> {
+pub fn load_workspace(
+    manifest_path: &AbsPathBuf,
+    options: WorkspaceLoadOptions,
+) -> Result<(RootDatabase, Vfs)> {
+    let start = Instant::now();
+    let progress_start = Instant::now();
+
+    println!(
+        "⏱️  load_workspace: proc macros = {}",
+        match options.proc_macro_server {
+            ProcMacroServerChoice::Sysroot => "enabled (sysroot)",
+            ProcMacroServerChoice::Explicit(_) => "enabled (explicit)",
+            ProcMacroServerChoice::None => "disabled",
+        }
+    );
+    println!(
+        "⏱️  load_workspace: build scripts / out dirs = {}",
+        if options.load_out_dirs_from_check {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "⏱️  load_workspace: prefill caches = {}",
+        if options.prefill_caches {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "⏱️  load_workspace: starting rust-analyzer load for {}",
+        <AbsPathBuf as AsRef<std::path::Path>>::as_ref(manifest_path).display()
+    );
+
     let (host, vfs, _proc_macro) = load_workspace_at(
         manifest_path.parent().unwrap().as_ref(),
         &CargoConfig {
@@ -55,17 +97,24 @@ pub fn load_workspace(manifest_path: &AbsPathBuf) -> Result<(RootDatabase, Vfs)>
             ..Default::default()
         },
         &LoadCargoConfig {
-            load_out_dirs_from_check: true,
-            with_proc_macro_server: ProcMacroServerChoice::Sysroot,
-            prefill_caches: true,
+            load_out_dirs_from_check: options.load_out_dirs_from_check,
+            with_proc_macro_server: options.proc_macro_server,
+            prefill_caches: options.prefill_caches,
         },
         &|msg: String| {
-            println!("  {}", msg);
+            println!(
+                "  [{:>6.2}s] {}",
+                progress_start.elapsed().as_secs_f32(),
+                msg
+            );
         },
     )
     .with_context(|| "Failed to load workspace")?;
 
-    println!("✅ Workspace loaded successfully!\n");
+    println!(
+        "✅ Workspace loaded successfully in {:.2}s!\n",
+        start.elapsed().as_secs_f32()
+    );
 
     Ok((host, vfs))
 }

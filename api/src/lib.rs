@@ -16,7 +16,7 @@
 //! ```
 //!
 //! ```rust,no_run
-//! use forgen_api::{plugin_export, FileReplacement, Plugin, Replacement, WorkspaceContext};
+//! use forgen_api::{plugin_suite, FileReplacement, Plugin, Replacement, WorkspaceContext};
 //!
 //! #[derive(Default)]
 //! pub struct MyPlugin;
@@ -33,9 +33,16 @@
 //!             let mut replacements = Vec::new();
 //!
 //!             for binding in file.bindings_of_type("f64") {
+//!                 let insert_at = binding.range.end;
+//!                 let indent = leading_indent(file.source(), insert_at);
+//!
 //!                 replacements.push(Replacement::insert(
-//!                     binding.range.end,
-//!                     format!("\nprintln!(\"{}: {{}}\", {});", binding.name, binding.name),
+//!                     insert_at,
+//!                     format!(
+//!                         "\n{indent}println!(\"{name}: {{}}\", {name});",
+//!                         indent = indent,
+//!                         name = binding.name,
+//!                     ),
 //!                 ));
 //!             }
 //!
@@ -48,7 +55,21 @@
 //!     }
 //! }
 //!
-//! plugin_export!(MyPlugin, "my-plugin");
+//! fn leading_indent(source: &str, offset: u32) -> String {
+//!     let up_to = (offset as usize).min(source.len());
+//!     let line_start = source[..up_to].rfind('\n').map(|i| i + 1).unwrap_or(0);
+//!
+//!     source[line_start..]
+//!         .chars()
+//!         .take_while(|c| *c == ' ' || *c == '\t')
+//!         .collect()
+//! }
+//!
+//! fn run(ctx: &WorkspaceContext) -> Vec<FileReplacement> {
+//!     MyPlugin.run(ctx)
+//! }
+//!
+//! plugin_suite!(run);
 //! ```
 
 mod context;
@@ -62,8 +83,8 @@ pub mod tree;
 // (or cherry-pick individual names).
 
 pub use context::{
-    EnumDef, FieldDef, FileContext, FnDef, FnParam, ImplDef, LetBinding, StructDef, VariantDef,
-    WorkspaceContext,
+    EnumDef, FieldDef, FileContext, FnDef, FnParam, ImplDef, LazyValue, LetBinding, StructDef,
+    VariantDef, WorkspaceContext,
 };
 pub use manifest::{Dependency, DependencySource, PackageManifest, WorkspaceManifest};
 pub use plugin::Plugin;
@@ -98,7 +119,7 @@ pub const FORGEN_ABI_VERSION: u64 = fnv1a(env!("CARGO_PKG_VERSION").as_bytes());
 pub use replacement::{FileReplacement, Replacement, TextRange};
 pub use tree::{DirNode, FileRef, FsEntry};
 
-// Re-export serde_json so the `plugin_export!` macro can reference it as
+// Re-export serde_json so the proc-macro helpers can reference it as
 // `::serde_json::…` without requiring plugin crates to add their own
 // serde_json dependency.
 #[doc(hidden)]

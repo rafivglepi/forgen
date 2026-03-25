@@ -2,6 +2,75 @@ use crate::syntax::raw::RawNode;
 use crate::TextRange;
 use crate::{manifest::WorkspaceManifest, tree::DirNode};
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::ops::Deref;
+use std::sync::{Arc, OnceLock};
+
+type LazyInit<T> = dyn Fn() -> T + Send + Sync + 'static;
+
+/// A small runtime-only lazy cell used by the Forgen CLI to defer expensive
+/// per-file and per-workspace computations until plugins actually request
+/// them.
+///
+/// This intentionally lives in `forgen-api` so both the CLI and plugin dylibs
+/// see the exact same type layout.
+pub struct LazyValue<T> {
+    value: OnceLock<T>,
+    init: Arc<LazyInit<T>>,
+}
+
+impl<T> LazyValue<T> {
+    /// Create a new lazy value from an initializer closure.
+    pub fn new<F>(init: F) -> Self
+    where
+        F: Fn() -> T + Send + Sync + 'static,
+    {
+        Self {
+            value: OnceLock::new(),
+            init: Arc::new(init),
+        }
+    }
+
+    /// Create a lazy value that is already initialized.
+    pub fn from_value(value: T) -> Self
+    where
+        T: Send + Sync + 'static,
+    {
+        let cell = OnceLock::new();
+        let _ = cell.set(value);
+        Self {
+            value: cell,
+            init: Arc::new(|| panic!("LazyValue initializer was called for an eager value")),
+        }
+    }
+
+    /// Get the value, initializing it on first access.
+    pub fn get(&self) -> &T {
+        self.value.get_or_init(|| (self.init)())
+    }
+
+    /// Returns `true` if this value has already been initialized.
+    pub fn is_initialized(&self) -> bool {
+        self.value.get().is_some()
+    }
+}
+
+impl<T> Deref for LazyValue<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.get()
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for LazyValue<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.value.get() {
+            Some(value) => f.debug_tuple("LazyValue").field(value).finish(),
+            None => f.write_str("LazyValue(<uninitialized>)"),
+        }
+    }
+}
 
 /// The entire workspace handed to every plugin in one shot.
 ///
@@ -9,23 +78,42 @@ use serde::{Deserialize, Serialize};
 /// of the workspace and passes it here. Plugins are therefore free to
 /// cross-reference files (e.g. "insert a log line in `a.rs` only if `b.rs`
 /// defines a certain type") without any extra plumbing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Expensive workspace-wide data may be computed lazily.
+#[derive(Debug)]
 pub struct WorkspaceContext {
     /// Absolute path to the workspace root on disk.
     /// Forward slashes are used on all platforms.
     pub workspace_root: String,
 
     /// Every Rust source file reachable from a local crate in the workspace.
+    ///
+    /// The list itself is eager, but the expensive per-file contents behind
+    /// each [`FileContext`] are lazy.
     pub files: Vec<FileContext>,
 
     /// Cargo metadata for the whole workspace.
     pub manifest: WorkspaceManifest,
 
-    /// The source file tree rooted at the workspace root.
-    pub file_tree: DirNode,
+    file_tree: LazyValue<DirNode>,
 }
 
 impl WorkspaceContext {
+    /// Create a new workspace context.
+    pub fn new(
+        workspace_root: String,
+        files: Vec<FileContext>,
+        manifest: WorkspaceManifest,
+        file_tree: LazyValue<DirNode>,
+    ) -> Self {
+        Self {
+            workspace_root,
+            files,
+            manifest,
+            file_tree,
+        }
+    }
+
     /// Find a file by its workspace-relative path (forward slashes).
     pub fn file(&self, path: &str) -> Option<&FileContext> {
         self.files.iter().find(|f| f.path == path)
@@ -37,48 +125,135 @@ impl WorkspaceContext {
             .iter()
             .filter(move |f| f.path.starts_with(prefix))
     }
+
+    /// The source file tree rooted at the workspace root.
+    pub fn file_tree(&self) -> &DirNode {
+        self.file_tree.get()
+    }
+
+    /// Returns `true` if the file tree has already been computed.
+    pub fn is_file_tree_initialized(&self) -> bool {
+        self.file_tree.is_initialized()
+    }
 }
 
-/// Pre-computed information about a single Rust source file.
+/// Information about a single Rust source file.
 ///
-/// All type information is resolved by the Forgen runtime using rust-analyzer
-/// before plugins are invoked. Plugins never need to depend on `ra_ap_*`
-/// crates — they work exclusively with the data in this struct.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The file identity (`path`) is always cheap and eager. Expensive derived data
+/// such as the CST, symbol lists, and inferred `let` binding types may be
+/// computed lazily by the Forgen runtime the first time a plugin requests them.
+#[derive(Debug)]
 pub struct FileContext {
     /// Path relative to the workspace root (forward slashes, no leading `./`).
     pub path: String,
 
-    /// Raw UTF-8 source text exactly as it exists on disk.
-    pub source: String,
-
-    /// The full CST of this file, with all trivia (whitespace, comments).
-    pub tree: RawNode,
-
-    /// Every `let` binding in the file, across all scopes (flattened).
-    /// This includes bindings inside function bodies, closures, blocks, etc.
-    pub let_bindings: Vec<LetBinding>,
-
-    /// All function and method definitions in the file (both top-level
-    /// functions and methods inside `impl` blocks are included).
-    pub functions: Vec<FnDef>,
-
-    /// Struct definitions.
-    pub structs: Vec<StructDef>,
-
-    /// Enum definitions.
-    pub enums: Vec<EnumDef>,
-
-    /// `impl` blocks (both inherent impls and trait impls).
-    /// Note: the methods in each `ImplDef` also appear in `functions` for
-    /// convenient flat iteration.
-    pub impls: Vec<ImplDef>,
+    source: LazyValue<String>,
+    tree: LazyValue<RawNode>,
+    let_bindings: LazyValue<Vec<LetBinding>>,
+    functions: LazyValue<Vec<FnDef>>,
+    structs: LazyValue<Vec<StructDef>>,
+    enums: LazyValue<Vec<EnumDef>>,
+    impls: LazyValue<Vec<ImplDef>>,
 }
 
 impl FileContext {
+    /// Create a new file context with lazy field initializers.
+    pub fn new(
+        path: String,
+        source: LazyValue<String>,
+        tree: LazyValue<RawNode>,
+        let_bindings: LazyValue<Vec<LetBinding>>,
+        functions: LazyValue<Vec<FnDef>>,
+        structs: LazyValue<Vec<StructDef>>,
+        enums: LazyValue<Vec<EnumDef>>,
+        impls: LazyValue<Vec<ImplDef>>,
+    ) -> Self {
+        Self {
+            path,
+            source,
+            tree,
+            let_bindings,
+            functions,
+            structs,
+            enums,
+            impls,
+        }
+    }
+
+    /// Raw UTF-8 source text exactly as it exists on disk.
+    pub fn source(&self) -> &str {
+        self.source.get().as_str()
+    }
+
+    /// The full CST of this file, with all trivia (whitespace, comments).
+    pub fn tree(&self) -> &RawNode {
+        self.tree.get()
+    }
+
+    /// Every `let` binding in the file, across all scopes (flattened).
+    /// This includes bindings inside function bodies, closures, blocks, etc.
+    pub fn let_bindings(&self) -> &[LetBinding] {
+        self.let_bindings.get().as_slice()
+    }
+
+    /// All function and method definitions in the file.
+    pub fn functions(&self) -> &[FnDef] {
+        self.functions.get().as_slice()
+    }
+
+    /// Struct definitions.
+    pub fn structs(&self) -> &[StructDef] {
+        self.structs.get().as_slice()
+    }
+
+    /// Enum definitions.
+    pub fn enums(&self) -> &[EnumDef] {
+        self.enums.get().as_slice()
+    }
+
+    /// `impl` blocks (both inherent impls and trait impls).
+    pub fn impls(&self) -> &[ImplDef] {
+        self.impls.get().as_slice()
+    }
+
+    /// Returns `true` if the file source has already been loaded.
+    pub fn is_source_initialized(&self) -> bool {
+        self.source.is_initialized()
+    }
+
+    /// Returns `true` if the CST has already been built.
+    pub fn is_tree_initialized(&self) -> bool {
+        self.tree.is_initialized()
+    }
+
+    /// Returns `true` if `let` bindings have already been extracted.
+    pub fn is_let_bindings_initialized(&self) -> bool {
+        self.let_bindings.is_initialized()
+    }
+
+    /// Returns `true` if function definitions have already been extracted.
+    pub fn is_functions_initialized(&self) -> bool {
+        self.functions.is_initialized()
+    }
+
+    /// Returns `true` if struct definitions have already been extracted.
+    pub fn is_structs_initialized(&self) -> bool {
+        self.structs.is_initialized()
+    }
+
+    /// Returns `true` if enum definitions have already been extracted.
+    pub fn is_enums_initialized(&self) -> bool {
+        self.enums.is_initialized()
+    }
+
+    /// Returns `true` if impl blocks have already been extracted.
+    pub fn is_impls_initialized(&self) -> bool {
+        self.impls.is_initialized()
+    }
+
     /// Find a `let` binding by variable name.
     pub fn binding(&self, name: &str) -> Option<&LetBinding> {
-        self.let_bindings.iter().find(|b| b.name == name)
+        self.let_bindings().iter().find(|b| b.name == name)
     }
 
     /// Iterate over all bindings whose effective type equals `ty`.
@@ -86,22 +261,24 @@ impl FileContext {
         &'a self,
         ty: &'a str,
     ) -> impl Iterator<Item = &'a LetBinding> + 'a {
-        self.let_bindings.iter().filter(move |b| b.ty() == Some(ty))
+        self.let_bindings()
+            .iter()
+            .filter(move |b| b.ty() == Some(ty))
     }
 
     /// Find a function definition by name.
     pub fn function(&self, name: &str) -> Option<&FnDef> {
-        self.functions.iter().find(|f| f.name == name)
+        self.functions().iter().find(|f| f.name == name)
     }
 
     /// Find a struct definition by name.
     pub fn struct_def(&self, name: &str) -> Option<&StructDef> {
-        self.structs.iter().find(|s| s.name == name)
+        self.structs().iter().find(|s| s.name == name)
     }
 
     /// Find an enum definition by name.
     pub fn enum_def(&self, name: &str) -> Option<&EnumDef> {
-        self.enums.iter().find(|e| e.name == name)
+        self.enums().iter().find(|e| e.name == name)
     }
 }
 
@@ -325,3 +502,4 @@ impl ImplDef {
         self.methods.iter().find(|m| m.name == name)
     }
 }
+

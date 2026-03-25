@@ -58,7 +58,8 @@ pub fn write_saved_replacements(
     fs::create_dir_all(&out_root)
         .with_context(|| format!("Failed to create {}", out_root.display()))?;
 
-    let file_map: HashMap<&str, &FileContext> = files.iter().map(|f| (f.path.as_str(), f)).collect();
+    let file_map: HashMap<&str, &FileContext> =
+        files.iter().map(|f| (f.path.as_str(), f)).collect();
 
     let mut paths: Vec<_> = by_path.keys().cloned().collect();
     paths.sort();
@@ -79,7 +80,7 @@ pub fn write_saved_replacements(
             .copied()
             .ok_or_else(|| anyhow!("Replacement references unknown file `{rel_path}`"))?;
 
-        let saved = serialise_file_replacements(&file.source, replacements)
+        let saved = serialise_file_replacements(file.source(), replacements)
             .with_context(|| format!("Failed to serialise replacements for `{}`", file.path))?;
 
         if saved.is_empty() {
@@ -160,14 +161,10 @@ fn normalise_raw_ops(source: &str, replacements: &[Replacement]) -> Result<Vec<R
             bail!("Replacement #{i} has start > end: [{start}..{end}]");
         }
         if end > len {
-            bail!(
-                "Replacement #{i} range [{start}..{end}] is out of bounds for file length {len}"
-            );
+            bail!("Replacement #{i} range [{start}..{end}] is out of bounds for file length {len}");
         }
         if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
-            bail!(
-                "Replacement #{i} range [{start}..{end}] does not lie on UTF-8 boundaries"
-            );
+            bail!("Replacement #{i} range [{start}..{end}] does not lie on UTF-8 boundaries");
         }
 
         ops.push(RawOp {
@@ -265,7 +262,12 @@ fn expanded_bounds(source: &str, start: usize, end: usize) -> (usize, usize) {
     (start, end)
 }
 
-fn apply_ops_to_chunk(source: &str, chunk_start: usize, chunk_end: usize, ops: &[RawOp]) -> Result<String> {
+fn apply_ops_to_chunk(
+    source: &str,
+    chunk_start: usize,
+    chunk_end: usize,
+    ops: &[RawOp],
+) -> Result<String> {
     let original = source
         .get(chunk_start..chunk_end)
         .ok_or_else(|| anyhow!("Chunk range [{chunk_start}..{chunk_end}] is invalid UTF-8"))?;
