@@ -100,6 +100,8 @@ pub fn load_workspace(
             load_out_dirs_from_check: options.load_out_dirs_from_check,
             with_proc_macro_server: options.proc_macro_server,
             prefill_caches: options.prefill_caches,
+            num_worker_threads: 1,
+            proc_macro_processes: 1,
         },
         &|msg: String| {
             println!(
@@ -190,7 +192,7 @@ pub fn apply_file_changes(
     let vfs_changes = vfs.take_changes();
 
     if !vfs_changes.is_empty() {
-        let mut change = ChangeWithProcMacros::new();
+        let mut change = ChangeWithProcMacros::default();
 
         for (file_id, vfs_change) in vfs_changes {
             match vfs_change.change {

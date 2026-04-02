@@ -36,7 +36,7 @@ impl<T> LazyValue<T> {
     where
         T: Send + Sync + 'static,
     {
-        let cell = OnceLock::new();
+        let cell: OnceLock<T> = OnceLock::new();
         let _ = cell.set(value);
         Self {
             value: cell,
@@ -502,4 +502,3 @@ impl ImplDef {
         self.methods.iter().find(|m| m.name == name)
     }
 }
-

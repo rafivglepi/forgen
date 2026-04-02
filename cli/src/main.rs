@@ -14,12 +14,10 @@ use forgen_api::{
     StructDef, TextRange as ApiTextRange, VariantDef, WorkspaceContext, WorkspaceManifest,
 };
 use notify_debouncer_mini::{new_debouncer, notify::*};
-use ra_ap_hir::{HirDisplay, Semantics};
+use ra_ap_hir::{DisplayTarget, HirDisplay, Local, Semantics};
 use ra_ap_ide_db::{base_db::SourceDatabase, EditionedFileId, RootDatabase};
 use ra_ap_paths::AbsPathBuf;
-use ra_ap_syntax::{
-    ast, ast::HasName, ast::HasVisibility, AstNode, Edition, SourceFile, SyntaxElement,
-};
+use ra_ap_syntax::{ast, ast::HasName, ast::HasVisibility, AstNode, SourceFile, SyntaxElement};
 use ra_ap_vfs::Vfs;
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -267,11 +265,10 @@ fn run_plugins(
     println!("⏱ entering semantics init");
     let sema = Semantics::new(db);
     println!("⏱ finished semantics init");
-    println!("⏱ about to call Crate::all");
 
-    // Enumerate source files directly from the VFS instead of walking the HIR
-    // module graph. This is much cheaper on large workspaces and avoids the
-    // expensive recursive `module.children()` traversal.
+    // Enumerate source files directly from the VFS. On newer rust-analyzer
+    // snapshots this avoids the pathological `Crate::all` / module traversal
+    // behavior while still giving us the local Rust files we need.
     let enumerate_start = Instant::now();
     let mut file_queue: Vec<EditionedFileId> = Vec::new();
     let mut local_vfs_file_count = 0usize;
@@ -290,13 +287,13 @@ fn run_plugins(
             continue;
         }
 
-        let editioned_id = EditionedFileId::current_edition(file_id);
+        let editioned_id = EditionedFileId::current_edition(db, file_id);
         file_queue.push(editioned_id);
         local_vfs_file_count += 1;
     }
 
     file_queue.sort_by_key(|id| {
-        workspace::file_id_to_path(vfs, id.file_id(), project_dir)
+        workspace::file_id_to_path(vfs, id.file_id(db), project_dir)
             .map(|p| normalize_path_str(&p.to_string_lossy()))
             .unwrap_or_default()
     });
@@ -441,7 +438,7 @@ impl FileRuntime {
     fn path(self) -> Option<PathBuf> {
         workspace::file_id_to_path(
             self.shared.vfs(),
-            self.editioned_id.file_id(),
+            self.editioned_id.file_id(self.shared.db()),
             self.shared.project_dir(),
         )
     }
@@ -457,14 +454,16 @@ impl FileRuntime {
     }
 
     fn source(self) -> String {
-        String::from(&*SourceDatabase::file_text(
+        SourceDatabase::file_text(
             self.shared.db(),
-            self.editioned_id.file_id(),
-        ))
+            self.editioned_id.file_id(self.shared.db()),
+        )
+        .text(self.shared.db())
+        .to_string()
     }
 
     fn syntax_from_source(self) -> ra_ap_syntax::SyntaxNode {
-        let (_file_id, edition) = self.editioned_id.unpack();
+        let (_file_id, edition) = self.editioned_id.unpack(self.shared.db());
         SourceFile::parse(&self.source(), edition)
             .tree()
             .syntax()
@@ -475,6 +474,7 @@ impl FileRuntime {
         let sema = Semantics::new(self.shared.db());
         let parsed = sema.parse(self.editioned_id);
         let syntax = parsed.syntax();
+
         let mut pat_type_cache: HashMap<(u32, u32), String> = HashMap::new();
 
         if self.shared.collect_inferred_let_types {
@@ -486,17 +486,34 @@ impl FileRuntime {
                     continue;
                 }
                 let Some(pat) = let_stmt.pat() else { continue };
-                let Some(init) = let_stmt.initializer() else {
+                let ast::Pat::IdentPat(ident_pat) = &pat else {
                     continue;
                 };
-                if let Some(type_info) = sema.type_of_expr(&init) {
-                    let ty_str = type_info
-                        .original
-                        .display(self.shared.db(), Edition::CURRENT)
-                        .to_string();
-                    let r = pat.syntax().text_range();
-                    pat_type_cache.insert((u32::from(r.start()), u32::from(r.end())), ty_str);
+                let Some(name) = ident_pat.name() else {
+                    continue;
+                };
+                if name.text() == "_" {
+                    continue;
                 }
+
+                let Some(local) = sema.to_def(ident_pat) else {
+                    continue;
+                };
+                let local: Local = local;
+                let ty = local.ty(self.shared.db());
+
+                let Some(scope) = sema.scope(let_stmt.syntax()) else {
+                    continue;
+                };
+
+                let ty_str = ty
+                    .display(
+                        self.shared.db(),
+                        DisplayTarget::from_crate(self.shared.db(), scope.krate().into()),
+                    )
+                    .to_string();
+                let r = pat.syntax().text_range();
+                pat_type_cache.insert((u32::from(r.start()), u32::from(r.end())), ty_str);
             }
         }
 
