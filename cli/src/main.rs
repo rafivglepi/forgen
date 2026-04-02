@@ -14,12 +14,12 @@ use forgen_api::{
     StructDef, TextRange as ApiTextRange, VariantDef, WorkspaceContext, WorkspaceManifest,
 };
 use notify_debouncer_mini::{new_debouncer, notify::*};
-use ra_ap_hir::{DisplayTarget, HirDisplay, Local, Semantics};
-use ra_ap_ide_db::{base_db::SourceDatabase, EditionedFileId, RootDatabase};
+use ra_ap_hir::{Crate, DisplayTarget, HirDisplay, Semantics, attach_db_allow_change};
+use ra_ap_ide_db::{base_db::SourceDatabase, EditionedFileId, FileId, RootDatabase};
 use ra_ap_paths::AbsPathBuf;
 use ra_ap_syntax::{ast, ast::HasName, ast::HasVisibility, AstNode, SourceFile, SyntaxElement};
 use ra_ap_vfs::Vfs;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
 use std::path::PathBuf;
@@ -262,68 +262,84 @@ fn run_plugins(
     }
     println!("⏱ plugin suite load took {:.2?}", suite_start.elapsed());
 
-    println!("⏱ entering semantics init");
-    let sema = Semantics::new(db);
-    println!("⏱ finished semantics init");
+    // All HIR operations (Semantics, Crate::all, type inference via
+    // `compute_let_bindings`) must run while the database is attached to the
+    // Salsa2 thread-local. `attach_db_allow_change` sets that up.
+    let workspace_ctx = attach_db_allow_change(db, || -> Result<_> {
+        println!("  entering semantics init");
+        let sema = Semantics::new(db);
+        println!("  finished semantics init");
 
-    // Enumerate source files directly from the VFS. On newer rust-analyzer
-    // snapshots this avoids the pathological `Crate::all` / module traversal
-    // behavior while still giving us the local Rust files we need.
-    let enumerate_start = Instant::now();
-    let mut file_queue: Vec<EditionedFileId> = Vec::new();
-    let mut local_vfs_file_count = 0usize;
-    let mut skipped_non_local_files = 0usize;
-    let root_norm = normalize_path_str(&project_dir.to_string_lossy());
+        // Enumerate source files via the crate graph.  This ensures every
+        // file is linked to an analyzed crate so type_of_expr() can resolve types.
+        let enumerate_start = Instant::now();
+        let mut seen: HashSet<FileId> = HashSet::new();
+        let mut file_queue: Vec<EditionedFileId> = Vec::new();
+        let root_norm = normalize_path_str(&project_dir.to_string_lossy());
 
-    for (file_id, vfs_path) in vfs.iter() {
-        let Some(abs_path) = vfs_path.as_path() else {
-            skipped_non_local_files += 1;
-            continue;
-        };
-
-        let path_norm = normalize_path_str(&abs_path.to_string());
-        if !path_norm.starts_with(&root_norm) || !path_norm.ends_with(".rs") {
-            skipped_non_local_files += 1;
-            continue;
+        for krate in Crate::all(db) {
+            if krate.origin(db).is_local() {
+                collect_module_files(db, &krate.root_module(db), &mut seen, &mut file_queue);
+            }
         }
 
-        let editioned_id = EditionedFileId::current_edition(db, file_id);
-        file_queue.push(editioned_id);
-        local_vfs_file_count += 1;
-    }
+        // Filter to only files inside the project root.
+        let mut local_vfs_file_count = 0usize;
+        let mut skipped_non_local_files = 0usize;
+        file_queue.retain(|editioned_id| {
+            let file_id = editioned_id.file_id(db);
+            let Some(path) = workspace::file_id_to_path(vfs, file_id, project_dir) else {
+                skipped_non_local_files += 1;
+                return false;
+            };
+            let path_norm = normalize_path_str(&path.to_string_lossy());
+            if path_norm.starts_with(&root_norm) && path_norm.ends_with(".rs") {
+                local_vfs_file_count += 1;
+                true
+            } else {
+                skipped_non_local_files += 1;
+                false
+            }
+        });
 
-    file_queue.sort_by_key(|id| {
-        workspace::file_id_to_path(vfs, id.file_id(db), project_dir)
-            .map(|p| normalize_path_str(&p.to_string_lossy()))
-            .unwrap_or_default()
-    });
+        file_queue.sort_by_key(|id| {
+            workspace::file_id_to_path(vfs, id.file_id(db), project_dir)
+                .map(|p| normalize_path_str(&p.to_string_lossy()))
+                .unwrap_or_default()
+        });
+        // Deduplicate (module traversal can yield a file multiple times).
+        file_queue.dedup_by_key(|id| id.file_id(db));
 
-    println!(
-        "⏱ direct VFS file enumeration took {:.2?} (local_rs_files={}, skipped={})",
-        enumerate_start.elapsed(),
-        local_vfs_file_count,
-        skipped_non_local_files
-    );
+        println!(
+            "  crate-graph file enumeration took {:.2?} (local={}, skipped={})",
+            enumerate_start.elapsed(),
+            local_vfs_file_count,
+            skipped_non_local_files
+        );
 
-    println!(
-        "🔍 Building workspace context from {} file(s)...",
-        file_queue.len()
-    );
+        println!(
+            "  Building workspace context from {} file(s)...",
+            file_queue.len()
+        );
 
-    let workspace_ctx_start = Instant::now();
-    let workspace_ctx = build_workspace_context(
-        &sema,
-        db,
-        vfs,
-        project_dir,
-        file_queue,
-        cargo_meta,
-        collect_inferred_let_types,
-    )?;
-    println!(
-        "⏱ workspace context build took {:.2?}",
-        workspace_ctx_start.elapsed()
-    );
+        let workspace_ctx_start = Instant::now();
+        let ctx = build_workspace_context(
+            &sema,
+            db,
+            vfs,
+            project_dir,
+            file_queue,
+            cargo_meta,
+            collect_inferred_let_types,
+        )?;
+        println!(
+            "  workspace context build took {:.2?}",
+            workspace_ctx_start.elapsed()
+        );
+
+        Ok(ctx)
+    })?;
+
 
     println!("🧩 Running {} plugin(s)...\n", plugins.len());
 
@@ -404,7 +420,6 @@ struct SharedRuntime {
     db: *const RootDatabase,
     vfs: *const Vfs,
     project_dir: *const PathBuf,
-    collect_inferred_let_types: bool,
     _not_send_sync: PhantomData<fn() -> ()>,
 }
 
@@ -470,56 +485,6 @@ impl FileRuntime {
             .clone()
     }
 
-    fn let_bindings(self) -> Vec<LetBinding> {
-        let sema = Semantics::new(self.shared.db());
-        let parsed = sema.parse(self.editioned_id);
-        let syntax = parsed.syntax();
-
-        let mut pat_type_cache: HashMap<(u32, u32), String> = HashMap::new();
-
-        if self.shared.collect_inferred_let_types {
-            for node in syntax.descendants() {
-                let Some(let_stmt) = ast::LetStmt::cast(node) else {
-                    continue;
-                };
-                if let_stmt.ty().is_some() {
-                    continue;
-                }
-                let Some(pat) = let_stmt.pat() else { continue };
-                let ast::Pat::IdentPat(ident_pat) = &pat else {
-                    continue;
-                };
-                let Some(name) = ident_pat.name() else {
-                    continue;
-                };
-                if name.text() == "_" {
-                    continue;
-                }
-
-                let Some(local) = sema.to_def(ident_pat) else {
-                    continue;
-                };
-                let local: Local = local;
-                let ty = local.ty(self.shared.db());
-
-                let Some(scope) = sema.scope(let_stmt.syntax()) else {
-                    continue;
-                };
-
-                let ty_str = ty
-                    .display(
-                        self.shared.db(),
-                        DisplayTarget::from_crate(self.shared.db(), scope.krate().into()),
-                    )
-                    .to_string();
-                let r = pat.syntax().text_range();
-                pat_type_cache.insert((u32::from(r.start()), u32::from(r.end())), ty_str);
-            }
-        }
-
-        extract_let_bindings(&syntax, &pat_type_cache)
-    }
-
     fn tree(self) -> RawNode {
         let syntax = self.syntax_from_source();
         build_raw_node(&syntax)
@@ -546,8 +511,57 @@ impl FileRuntime {
     }
 }
 
+/// Compute inferred types for unannotated `let` bindings — this **must** be
+/// called eagerly (not inside a lazy closure invoked from a dylib plugin),
+/// because Salsa's "attached db" mechanism panics when HIR queries are made
+/// outside the original database context.
+fn compute_let_bindings(
+    sema: &Semantics<RootDatabase>,
+    db: &RootDatabase,
+    editioned_id: EditionedFileId,
+    collect_inferred: bool,
+) -> Vec<LetBinding> {
+    let parsed = sema.parse(editioned_id);
+    let syntax = parsed.syntax();
+
+    let mut pat_type_cache: HashMap<(u32, u32), String> = HashMap::new();
+
+    if collect_inferred {
+        for node in syntax.descendants() {
+            let Some(let_stmt) = ast::LetStmt::cast(node) else {
+                continue;
+            };
+            if let_stmt.ty().is_some() {
+                continue;
+            }
+            let Some(pat) = let_stmt.pat() else { continue };
+            let Some(init) = let_stmt.initializer() else {
+                continue;
+            };
+            if let Some(type_info) = sema.type_of_expr(&init) {
+                let ty_str = if let Some(scope) = sema.scope(let_stmt.syntax()) {
+                    type_info
+                        .original
+                        .display(
+                            db,
+                            DisplayTarget::from_crate(db, scope.krate().into()),
+                        )
+                        .to_string()
+                } else {
+                    continue;
+                };
+                let r = pat.syntax().text_range();
+                pat_type_cache.insert((u32::from(r.start()), u32::from(r.end())), ty_str);
+            }
+        }
+    }
+
+    extract_let_bindings(syntax, &pat_type_cache)
+}
+
+
 fn build_workspace_context(
-    _sema: &Semantics<RootDatabase>,
+    sema: &Semantics<RootDatabase>,
     db: &RootDatabase,
     vfs: &Vfs,
     project_dir: &PathBuf,
@@ -566,7 +580,6 @@ fn build_workspace_context(
         db: db as *const RootDatabase,
         vfs: vfs as *const Vfs,
         project_dir: project_dir as *const PathBuf,
-        collect_inferred_let_types,
         _not_send_sync: PhantomData,
     };
 
@@ -587,9 +600,13 @@ fn build_workspace_context(
 
         paths_for_tree.push(rel_path.clone());
 
+        // `let_bindings` must be computed eagerly here — HIR queries (type
+        // inference) go through the Salsa "attached db" mechanism and panic
+        // if called from inside a lazy closure invoked by a dylib plugin.
+        let let_bindings = compute_let_bindings(sema, db, editioned_id, collect_inferred_let_types);
+
         let source_runtime = runtime;
         let tree_runtime = runtime;
-        let lets_runtime = runtime;
         let functions_runtime = runtime;
         let structs_runtime = runtime;
         let enums_runtime = runtime;
@@ -599,7 +616,7 @@ fn build_workspace_context(
             rel_path,
             LazyValue::new(move || source_runtime.source()),
             LazyValue::new(move || tree_runtime.tree()),
-            LazyValue::new(move || lets_runtime.let_bindings()),
+            LazyValue::from_value(let_bindings),
             LazyValue::new(move || functions_runtime.functions()),
             LazyValue::new(move || structs_runtime.structs()),
             LazyValue::new(move || enums_runtime.enums()),
@@ -1416,6 +1433,24 @@ fn extract_impls(syntax: &ra_ap_syntax::SyntaxNode) -> Vec<ImplDef> {
         .collect()
 }
 
+
 // ---------------------------------------------------------------------------
-// VFS-backed file enumeration
+// Module file collector
 // ---------------------------------------------------------------------------
+
+fn collect_module_files(
+    db: &RootDatabase,
+    module: &ra_ap_hir::Module,
+    seen: &mut HashSet<FileId>,
+    queue: &mut Vec<EditionedFileId>,
+) {
+    if let Some(editioned_id) = module.definition_source(db).file_id.file_id() {
+        let file_id = editioned_id.file_id(db);
+        if seen.insert(file_id) {
+            queue.push(editioned_id);
+        }
+    }
+    for child in module.children(db) {
+        collect_module_files(db, &child, seen, queue);
+    }
+}
