@@ -1,4 +1,5 @@
 mod loader;
+mod oracle;
 mod replacements;
 mod workspace;
 
@@ -11,10 +12,11 @@ use forgen_api::{
     syntax::SyntaxKind,
     Dependency, DependencySource, DirNode, EnumDef, FieldDef, FileContext as ApiFileContext,
     FileRef, FnDef, FnParam, FsEntry, ImplDef, LazyValue, LetBinding, PackageManifest, Plugin,
-    StructDef, TextRange as ApiTextRange, VariantDef, WorkspaceContext, WorkspaceManifest,
+    SemanticHandle, StructDef, TextRange as ApiTextRange, VariantDef, WorkspaceContext,
+    WorkspaceManifest,
 };
 use notify_debouncer_mini::{new_debouncer, notify::*};
-use ra_ap_hir::{Crate, DisplayTarget, HirDisplay, Semantics, attach_db_allow_change};
+use ra_ap_hir::{attach_db_allow_change, Crate, Semantics};
 use ra_ap_ide_db::{base_db::SourceDatabase, EditionedFileId, FileId, RootDatabase};
 use ra_ap_paths::AbsPathBuf;
 use ra_ap_syntax::{ast, ast::HasName, ast::HasVisibility, AstNode, SourceFile, SyntaxElement};
@@ -23,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
 use std::path::PathBuf;
-use std::sync::{mpsc::channel, OnceLock};
+use std::sync::{mpsc::channel, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -58,10 +60,6 @@ struct Args {
     #[arg(long)]
     no_proc_macros: bool,
 
-    /// Disable eager inferred-type collection for unannotated `let` bindings
-    #[arg(long)]
-    no_inferred_let_types: bool,
-
     /// Re-enable build-script / out-dir loading while loading the workspace
     #[arg(long)]
     with_build_scripts: bool,
@@ -69,6 +67,10 @@ struct Args {
     /// Re-enable rust-analyzer cache prefill while loading the workspace
     #[arg(long)]
     with_prefill_caches: bool,
+
+    /// Print oracle inference traces (binding text + inferred type) to stderr
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +140,7 @@ fn main() -> Result<()> {
         println!("👀 Watch mode enabled - monitoring for changes...\n");
         println!("Press Ctrl+C to stop\n");
 
-        run_plugins(&host, &vfs, &workspace_info, !args.no_inferred_let_types)?;
+        run_plugins(&host, &vfs, &workspace_info, true, args.verbose)?;
 
         let (tx, rx) = channel();
         let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
@@ -206,15 +208,13 @@ fn main() -> Result<()> {
 
                         println!("🔄 File system change detected, re-running plugins...");
                         match workspace::apply_file_changes(&mut host, &mut vfs, &changed_files) {
-                            Ok(_) => match run_plugins(
-                                &host,
-                                &vfs,
-                                &workspace_info,
-                                !args.no_inferred_let_types,
-                            ) {
-                                Ok(_) => println!("✅ Done\n"),
-                                Err(e) => eprintln!("❌ Plugin error: {}\n", e),
-                            },
+                            Ok(_) => {
+                                match run_plugins(&host, &vfs, &workspace_info, false, args.verbose)
+                                {
+                                    Ok(_) => println!("✅ Done\n"),
+                                    Err(e) => eprintln!("❌ Plugin error: {}\n", e),
+                                }
+                            }
                             Err(e) => eprintln!("❌ Error applying file changes: {}\n", e),
                         }
                     }
@@ -228,7 +228,7 @@ fn main() -> Result<()> {
         }
     } else {
         let run_start = Instant::now();
-        run_plugins(&host, &vfs, &workspace_info, !args.no_inferred_let_types)?;
+        run_plugins(&host, &vfs, &workspace_info, true, args.verbose)?;
         println!("⏱ plugin run took {:.2?}", run_start.elapsed());
         println!("⏱ total CLI time {:.2?}", total_start.elapsed());
         println!("\n✨ Done!");
@@ -245,7 +245,8 @@ fn run_plugins(
     db: &RootDatabase,
     vfs: &Vfs,
     workspace_info: &workspace::WorkspaceInfo,
-    collect_inferred_let_types: bool,
+    build: bool,
+    verbose: bool,
 ) -> Result<()> {
     let run_start = Instant::now();
     let project_dir = &workspace_info.root;
@@ -256,132 +257,174 @@ fn run_plugins(
 
     // Plugin suite: `[workspace.metadata.forgen] suite = "..."`
     let suite_start = Instant::now();
-    if let Some(suite) = loader::load_suite(cargo_meta) {
+    if let Some(suite) = loader::load_suite(cargo_meta, build) {
         println!();
         plugins.push(suite);
     }
     println!("⏱ plugin suite load took {:.2?}", suite_start.elapsed());
 
     // All HIR operations (Semantics, Crate::all, type inference via
-    // `compute_let_bindings`) must run while the database is attached to the
-    // Salsa2 thread-local. `attach_db_allow_change` sets that up.
-    let workspace_ctx = attach_db_allow_change(db, || -> Result<_> {
-        println!("  entering semantics init");
-        let sema = Semantics::new(db);
-        println!("  finished semantics init");
+    // `CliOracle`) must run while the database is attached to the Salsa2
+    // thread-local. We extend the scope to cover the full plugin loop so that
+    // LazyValue closures captured by plugins remain valid.
+    let (workspace_ctx, replacements_by_path, total_changes) =
+        attach_db_allow_change(db, || -> Result<_> {
+            println!("  entering semantics init");
+            let sema = Semantics::new(db);
+            println!("  finished semantics init");
 
-        // Enumerate source files via the crate graph.  This ensures every
-        // file is linked to an analyzed crate so type_of_expr() can resolve types.
-        let enumerate_start = Instant::now();
-        let mut seen: HashSet<FileId> = HashSet::new();
-        let mut file_queue: Vec<EditionedFileId> = Vec::new();
-        let root_norm = normalize_path_str(&project_dir.to_string_lossy());
+            // Enumerate source files via the crate graph.  This ensures every
+            // file is linked to an analyzed crate so type_of_expr() can resolve types.
+            let enumerate_start = Instant::now();
+            let mut seen: HashSet<FileId> = HashSet::new();
+            let mut file_queue: Vec<EditionedFileId> = Vec::new();
+            let root_norm = normalize_path_str(&project_dir.to_string_lossy());
 
-        for krate in Crate::all(db) {
-            if krate.origin(db).is_local() {
-                collect_module_files(db, &krate.root_module(db), &mut seen, &mut file_queue);
+            let crate_all = Crate::all(db);
+
+            for krate in &crate_all {
+                if !krate.origin(db).is_local() {
+                    continue;
+                }
+                for file_id in db
+                    .source_root(db.file_source_root(krate.root_file(db)).source_root_id(db))
+                    .source_root(db)
+                    .iter()
+                {
+                    if seen.insert(file_id) {
+                        file_queue.push(EditionedFileId::new(db, file_id, krate.edition(db)));
+                    }
+                }
             }
-        }
 
-        // Filter to only files inside the project root.
-        let mut local_vfs_file_count = 0usize;
-        let mut skipped_non_local_files = 0usize;
-        file_queue.retain(|editioned_id| {
-            let file_id = editioned_id.file_id(db);
-            let Some(path) = workspace::file_id_to_path(vfs, file_id, project_dir) else {
-                skipped_non_local_files += 1;
-                return false;
-            };
-            let path_norm = normalize_path_str(&path.to_string_lossy());
-            if path_norm.starts_with(&root_norm) && path_norm.ends_with(".rs") {
-                local_vfs_file_count += 1;
-                true
-            } else {
-                skipped_non_local_files += 1;
-                false
-            }
-        });
+            let valid_roots: Vec<String> = cargo_meta
+                .workspace_packages()
+                .into_iter()
+                .filter(|p| p.dependencies.iter().any(|d| d.name == "forgen"))
+                .map(|p| {
+                    let mut rp = normalize_path_str(&p.manifest_path.parent().unwrap().to_string());
+                    if !rp.ends_with('/') {
+                        rp.push('/');
+                    }
+                    rp
+                })
+                .collect();
 
-        file_queue.sort_by_key(|id| {
-            workspace::file_id_to_path(vfs, id.file_id(db), project_dir)
-                .map(|p| normalize_path_str(&p.to_string_lossy()))
-                .unwrap_or_default()
-        });
-        // Deduplicate (module traversal can yield a file multiple times).
-        file_queue.dedup_by_key(|id| id.file_id(db));
+            // Pre-compute normalized paths once to avoid redundant VFS lookups
+            // during retain, sort, and dedup.
+            let path_cache: HashMap<FileId, Option<String>> = file_queue
+                .iter()
+                .map(|ef| {
+                    let fid = ef.file_id(db);
+                    let norm = workspace::file_id_to_path(vfs, fid, project_dir)
+                        .map(|p| normalize_path_str(&p.to_string_lossy()));
+                    (fid, norm)
+                })
+                .collect();
 
-        println!(
-            "  crate-graph file enumeration took {:.2?} (local={}, skipped={})",
-            enumerate_start.elapsed(),
-            local_vfs_file_count,
-            skipped_non_local_files
-        );
+            // Filter to only files inside valid project roots.
+            let mut local_vfs_file_count = 0usize;
+            let mut skipped_non_local_files = 0usize;
+            file_queue.retain(|ef| {
+                let fid = ef.file_id(db);
+                let Some(path_norm) = path_cache.get(&fid).and_then(|p| p.as_deref()) else {
+                    skipped_non_local_files += 1;
+                    return false;
+                };
+                if path_norm.starts_with(&root_norm) && path_norm.ends_with(".rs") {
+                    let is_valid = valid_roots.is_empty()
+                        || valid_roots
+                            .iter()
+                            .any(|r| path_norm.starts_with(r.as_str()));
+                    if is_valid {
+                        local_vfs_file_count += 1;
+                        true
+                    } else {
+                        skipped_non_local_files += 1;
+                        false
+                    }
+                } else {
+                    skipped_non_local_files += 1;
+                    false
+                }
+            });
 
-        println!(
-            "  Building workspace context from {} file(s)...",
-            file_queue.len()
-        );
+            // sort_by_cached_key computes each key exactly once (vs sort_by_key's O(n log n) recomputation).
+            file_queue.sort_by_cached_key(|ef| {
+                path_cache
+                    .get(&ef.file_id(db))
+                    .and_then(|p| p.clone())
+                    .unwrap_or_default()
+            });
 
-        let workspace_ctx_start = Instant::now();
-        let ctx = build_workspace_context(
-            &sema,
-            db,
-            vfs,
-            project_dir,
-            file_queue,
-            cargo_meta,
-            collect_inferred_let_types,
-        )?;
-        println!(
-            "  workspace context build took {:.2?}",
-            workspace_ctx_start.elapsed()
-        );
-
-        Ok(ctx)
-    })?;
-
-
-    println!("🧩 Running {} plugin(s)...\n", plugins.len());
-
-    let plugin_exec_start = Instant::now();
-    let mut total_changes: usize = 0;
-    let mut replacements_by_path: HashMap<String, Vec<Replacement>> = HashMap::new();
-
-    for plugin in &plugins {
-        let plugin_start = Instant::now();
-        let file_replacements = plugin.run(&workspace_ctx);
-
-        let mut plugin_changes = 0usize;
-        for fr in file_replacements {
-            if fr.replacements.is_empty() {
-                continue;
-            }
+            // Deduplicate (module traversal can yield a file multiple times).
+            file_queue.dedup_by_key(|ef| ef.file_id(db));
 
             println!(
-                "  🧩 {} → {} replacement(s)  [{}]",
-                fr.path,
-                fr.replacements.len(),
-                plugin.name(),
+                "  crate-graph file enumeration took {:.2?} (local={}, skipped={})",
+                enumerate_start.elapsed(),
+                local_vfs_file_count,
+                skipped_non_local_files
             );
-            total_changes += fr.replacements.len();
-            plugin_changes += fr.replacements.len();
-            replacements_by_path
-                .entry(fr.path)
-                .or_default()
-                .extend(fr.replacements);
-        }
 
-        println!(
-            "⏱ plugin '{}' execution took {:.2?} ({} replacement(s))",
-            plugin.name(),
-            plugin_start.elapsed(),
-            plugin_changes
-        );
-    }
-    println!(
-        "⏱ all plugin execution took {:.2?}",
-        plugin_exec_start.elapsed()
-    );
+            println!(
+                "  Building workspace context from {} file(s)...",
+                file_queue.len()
+            );
+
+            let workspace_ctx_start = Instant::now();
+            let ctx = build_workspace_context(
+                &sema,
+                db,
+                vfs,
+                project_dir,
+                file_queue,
+                cargo_meta,
+                verbose,
+            )?;
+            println!(
+                "  workspace context build took {:.2?}",
+                workspace_ctx_start.elapsed()
+            );
+
+            // ── Plugin execution (inside the attach_db scope) ─────────────────
+            println!("🧩 Running {} plugin(s)...\n", plugins.len());
+            let plugin_exec_start = Instant::now();
+            let mut replacements_by_path: HashMap<String, Vec<Replacement>> = HashMap::new();
+            let mut total_changes: usize = 0;
+
+            for plugin in &plugins {
+                let _plugin_start = Instant::now();
+                let file_replacements = plugin.run(&ctx);
+
+                let mut plugin_changes = 0usize;
+                for fr in file_replacements {
+                    if fr.replacements.is_empty() {
+                        continue;
+                    }
+
+                    println!(
+                        "  🧩 {} → {} replacement(s)",
+                        fr.path,
+                        fr.replacements.len(),
+                    );
+                    total_changes += fr.replacements.len();
+                    plugin_changes += fr.replacements.len();
+                    replacements_by_path
+                        .entry(fr.path)
+                        .or_default()
+                        .extend(fr.replacements);
+                }
+
+                println!(
+                    "⏱ plugin suite execution took {:.2?} ({} replacement(s))",
+                    plugin_exec_start.elapsed(),
+                    plugin_changes
+                );
+            }
+
+            Ok((ctx, replacements_by_path, total_changes))
+        })?;
 
     let write_start = Instant::now();
     let total_saved = replacements::write_saved_replacements(
@@ -511,63 +554,14 @@ impl FileRuntime {
     }
 }
 
-/// Compute inferred types for unannotated `let` bindings — this **must** be
-/// called eagerly (not inside a lazy closure invoked from a dylib plugin),
-/// because Salsa's "attached db" mechanism panics when HIR queries are made
-/// outside the original database context.
-fn compute_let_bindings(
-    sema: &Semantics<RootDatabase>,
-    db: &RootDatabase,
-    editioned_id: EditionedFileId,
-    collect_inferred: bool,
-) -> Vec<LetBinding> {
-    let parsed = sema.parse(editioned_id);
-    let syntax = parsed.syntax();
-
-    let mut pat_type_cache: HashMap<(u32, u32), String> = HashMap::new();
-
-    if collect_inferred {
-        for node in syntax.descendants() {
-            let Some(let_stmt) = ast::LetStmt::cast(node) else {
-                continue;
-            };
-            if let_stmt.ty().is_some() {
-                continue;
-            }
-            let Some(pat) = let_stmt.pat() else { continue };
-            let Some(init) = let_stmt.initializer() else {
-                continue;
-            };
-            if let Some(type_info) = sema.type_of_expr(&init) {
-                let ty_str = if let Some(scope) = sema.scope(let_stmt.syntax()) {
-                    type_info
-                        .original
-                        .display(
-                            db,
-                            DisplayTarget::from_crate(db, scope.krate().into()),
-                        )
-                        .to_string()
-                } else {
-                    continue;
-                };
-                let r = pat.syntax().text_range();
-                pat_type_cache.insert((u32::from(r.start()), u32::from(r.end())), ty_str);
-            }
-        }
-    }
-
-    extract_let_bindings(syntax, &pat_type_cache)
-}
-
-
 fn build_workspace_context(
-    sema: &Semantics<RootDatabase>,
+    _sema: &Semantics<RootDatabase>,
     db: &RootDatabase,
     vfs: &Vfs,
     project_dir: &PathBuf,
     file_queue: Vec<EditionedFileId>,
     cargo_meta: &cargo_metadata::Metadata,
-    collect_inferred_let_types: bool,
+    verbose: bool,
 ) -> Result<WorkspaceContext> {
     let ctx_start = Instant::now();
 
@@ -575,6 +569,34 @@ fn build_workspace_context(
     let manifest_start = Instant::now();
     let manifest = build_manifest(cargo_meta);
     println!("⏱ manifest build took {:.2?}", manifest_start.elapsed());
+
+    // Build the CliOracle (shared across all file contexts for this run).
+    let mut file_map: HashMap<String, EditionedFileId> = HashMap::new();
+    // We'll populate file_map as we iterate the file queue below, then build
+    // the oracle after (two-pass). Pre-populate to avoid a clone of file_queue.
+    for editioned_id in &file_queue {
+        let runtime_tmp = FileRuntime {
+            shared: SharedRuntime {
+                db: db as *const RootDatabase,
+                vfs: vfs as *const Vfs,
+                project_dir: project_dir as *const PathBuf,
+                _not_send_sync: PhantomData,
+            },
+            editioned_id: *editioned_id,
+        };
+        if let Some(rel) = runtime_tmp.rel_path(&root_norm) {
+            file_map.insert(rel, *editioned_id);
+        }
+    }
+
+    let oracle = Arc::new(oracle::CliOracle {
+        db: db as *const RootDatabase,
+        vfs: vfs as *const Vfs,
+        file_map,
+        root_norm: root_norm.clone(),
+        verbose,
+    });
+    let workspace_handle: SemanticHandle = oracle.clone().into_handle();
 
     let shared = SharedRuntime {
         db: db as *const RootDatabase,
@@ -600,10 +622,50 @@ fn build_workspace_context(
 
         paths_for_tree.push(rel_path.clone());
 
-        // `let_bindings` must be computed eagerly here — HIR queries (type
-        // inference) go through the Salsa "attached db" mechanism and panic
-        // if called from inside a lazy closure invoked by a dylib plugin.
-        let let_bindings = compute_let_bindings(sema, db, editioned_id, collect_inferred_let_types);
+        // ── Syntax pass (no RA) ───────────────────────────────────────────
+        // Extract binding stubs from the CST, then enrich each unannotated
+        // binding with a per-binding lazy closure that fires RA on first
+        // `.ty()` call.  This is safe because the oracle (and therefore `db`)
+        // remains valid for the lifetime of the `attach_db_allow_change` scope
+        // that wraps both this build step AND `plugin.run()`.
+        let syntax_bindings =
+            oracle::extract_let_bindings_from_syntax(&runtime.syntax_from_source());
+        let let_bindings: Vec<LetBinding> = {
+            let oracle_for_bindings = Arc::clone(&oracle);
+            let rel_for_bindings = rel_path.clone();
+            syntax_bindings
+                .into_iter()
+                .map(move |b| {
+                    let inferred_type = if b.explicit_type.is_some() {
+                        // Annotated — no RA ever needed.
+                        LazyValue::from_value(None)
+                    } else if let Some(init_range) = b.initializer_range {
+                        // Unannotated — defer to oracle on first `.ty()` call.
+                        let o = Arc::clone(&oracle_for_bindings);
+                        let fp = rel_for_bindings.clone();
+                        LazyValue::new(move || {
+                            let db = unsafe { &*o.db };
+                            let sema_inner = ra_ap_hir::Semantics::new(db);
+                            o.file_map.get(&fp).and_then(|&eid| {
+                                oracle::infer_type_at_range(
+                                    &sema_inner,
+                                    db,
+                                    eid,
+                                    init_range,
+                                    &fp,
+                                    o.verbose,
+                                )
+                            })
+                        })
+                    } else {
+                        LazyValue::from_value(None)
+                    };
+                    LetBinding { inferred_type, ..b }
+                })
+                .collect()
+        };
+
+        let file_handle: SemanticHandle = Arc::clone(&oracle).into_handle();
 
         let source_runtime = runtime;
         let tree_runtime = runtime;
@@ -621,6 +683,7 @@ fn build_workspace_context(
             LazyValue::new(move || structs_runtime.structs()),
             LazyValue::new(move || enums_runtime.enums()),
             LazyValue::new(move || impls_runtime.impls()),
+            Some(file_handle),
         ));
     }
 
@@ -641,7 +704,13 @@ fn build_workspace_context(
         skipped_files
     );
 
-    Ok(WorkspaceContext::new(root_norm, files, manifest, file_tree))
+    Ok(WorkspaceContext::new(
+        root_norm,
+        files,
+        manifest,
+        file_tree,
+        Some(workspace_handle),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1179,55 +1248,6 @@ fn to_api_range(r: ra_ap_syntax::TextRange) -> ApiTextRange {
     }
 }
 
-fn extract_let_bindings(
-    syntax: &ra_ap_syntax::SyntaxNode,
-    pat_types: &HashMap<(u32, u32), String>,
-) -> Vec<LetBinding> {
-    let mut bindings = Vec::new();
-
-    for node in syntax.descendants() {
-        let Some(let_stmt) = ast::LetStmt::cast(node) else {
-            continue;
-        };
-        let Some(pat) = let_stmt.pat() else { continue };
-
-        let (name, is_mut) = match &pat {
-            ast::Pat::IdentPat(ident_pat) => {
-                let Some(n) = ident_pat.name() else { continue };
-                (n.to_string(), ident_pat.mut_token().is_some())
-            }
-            _ => continue,
-        };
-
-        if name.is_empty() || name == "_" {
-            continue;
-        }
-
-        let explicit_type = let_stmt
-            .ty()
-            .map(|ty| ty.syntax().text().to_string().trim().to_owned());
-
-        let inferred_type = if explicit_type.is_none() {
-            let r = pat.syntax().text_range();
-            pat_types
-                .get(&(u32::from(r.start()), u32::from(r.end())))
-                .cloned()
-        } else {
-            None
-        };
-
-        bindings.push(LetBinding {
-            name,
-            explicit_type,
-            inferred_type,
-            range: to_api_range(let_stmt.syntax().text_range()),
-            is_mut,
-        });
-    }
-
-    bindings
-}
-
 fn extract_fn_def(fn_node: &ast::Fn) -> Option<FnDef> {
     let name = fn_node.name()?.to_string();
 
@@ -1431,26 +1451,4 @@ fn extract_impls(syntax: &ra_ap_syntax::SyntaxNode) -> Vec<ImplDef> {
             })
         })
         .collect()
-}
-
-
-// ---------------------------------------------------------------------------
-// Module file collector
-// ---------------------------------------------------------------------------
-
-fn collect_module_files(
-    db: &RootDatabase,
-    module: &ra_ap_hir::Module,
-    seen: &mut HashSet<FileId>,
-    queue: &mut Vec<EditionedFileId>,
-) {
-    if let Some(editioned_id) = module.definition_source(db).file_id.file_id() {
-        let file_id = editioned_id.file_id(db);
-        if seen.insert(file_id) {
-            queue.push(editioned_id);
-        }
-    }
-    for child in module.children(db) {
-        collect_module_files(db, &child, seen, queue);
-    }
 }

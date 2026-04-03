@@ -75,6 +75,7 @@
 mod context;
 pub mod manifest;
 mod plugin;
+pub mod query;
 mod replacement;
 pub mod syntax;
 pub mod tree;
@@ -86,6 +87,7 @@ pub use context::{
     EnumDef, FieldDef, FileContext, FnDef, FnParam, ImplDef, LazyValue, LetBinding, StructDef,
     VariantDef, WorkspaceContext,
 };
+pub use query::{SemanticHandle, SemanticQuery, SemanticResult};
 pub use manifest::{Dependency, DependencySource, PackageManifest, WorkspaceManifest};
 pub use plugin::Plugin;
 

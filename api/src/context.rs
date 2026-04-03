@@ -1,3 +1,4 @@
+use crate::query::SemanticHandle;
 use crate::syntax::raw::RawNode;
 use crate::TextRange;
 use crate::{manifest::WorkspaceManifest, tree::DirNode};
@@ -55,6 +56,25 @@ impl<T> LazyValue<T> {
     }
 }
 
+impl<T: Clone + Send + Sync + 'static> Clone for LazyValue<T> {
+    fn clone(&self) -> Self {
+        // If already initialized, reuse the value; otherwise share the init fn.
+        match self.value.get() {
+            Some(v) => LazyValue::from_value(v.clone()),
+            None => LazyValue {
+                value: OnceLock::new(),
+                init: Arc::clone(&self.init),
+            },
+        }
+    }
+}
+
+impl Default for LazyValue<Option<String>> {
+    fn default() -> Self {
+        LazyValue::from_value(None)
+    }
+}
+
 impl<T> Deref for LazyValue<T> {
     type Target = T;
 
@@ -96,6 +116,10 @@ pub struct WorkspaceContext {
     pub manifest: WorkspaceManifest,
 
     file_tree: LazyValue<DirNode>,
+
+    /// Oracle for semantic (RA-backed) queries across the workspace.
+    /// `None` when running without a live rust-analyzer context (tests).
+    semantics: Option<SemanticHandle>,
 }
 
 impl WorkspaceContext {
@@ -105,12 +129,14 @@ impl WorkspaceContext {
         files: Vec<FileContext>,
         manifest: WorkspaceManifest,
         file_tree: LazyValue<DirNode>,
+        semantics: Option<SemanticHandle>,
     ) -> Self {
         Self {
             workspace_root,
             files,
             manifest,
             file_tree,
+            semantics,
         }
     }
 
@@ -135,6 +161,12 @@ impl WorkspaceContext {
     pub fn is_file_tree_initialized(&self) -> bool {
         self.file_tree.is_initialized()
     }
+
+    /// Oracle for semantic (RA-backed) queries on the whole workspace.
+    /// `None` when running without a live rust-analyzer context (tests).
+    pub fn semantics(&self) -> Option<&SemanticHandle> {
+        self.semantics.as_ref()
+    }
 }
 
 /// Information about a single Rust source file.
@@ -149,11 +181,16 @@ pub struct FileContext {
 
     source: LazyValue<String>,
     tree: LazyValue<RawNode>,
+    /// Syntax pass only — each binding carries its own lazy `inferred_type`.
     let_bindings: LazyValue<Vec<LetBinding>>,
     functions: LazyValue<Vec<FnDef>>,
     structs: LazyValue<Vec<StructDef>>,
     enums: LazyValue<Vec<EnumDef>>,
     impls: LazyValue<Vec<ImplDef>>,
+
+    /// Oracle for semantic (RA-backed) queries on this file.
+    /// `None` when running without a live rust-analyzer context (tests).
+    semantics: Option<SemanticHandle>,
 }
 
 impl FileContext {
@@ -167,6 +204,7 @@ impl FileContext {
         structs: LazyValue<Vec<StructDef>>,
         enums: LazyValue<Vec<EnumDef>>,
         impls: LazyValue<Vec<ImplDef>>,
+        semantics: Option<SemanticHandle>,
     ) -> Self {
         Self {
             path,
@@ -177,6 +215,7 @@ impl FileContext {
             structs,
             enums,
             impls,
+            semantics,
         }
     }
 
@@ -280,6 +319,24 @@ impl FileContext {
     pub fn enum_def(&self, name: &str) -> Option<&EnumDef> {
         self.enums().iter().find(|e| e.name == name)
     }
+
+    /// Oracle for semantic (RA-backed) queries on this file.
+    /// `None` when running without a live rust-analyzer context (tests).
+    pub fn semantics(&self) -> Option<&SemanticHandle> {
+        self.semantics.as_ref()
+    }
+
+    /// Shortcut: infer the type of the expression at `range` in this file.
+    pub fn infer_type_at(&self, range: TextRange) -> Option<String> {
+        self.semantics()?.infer_type_at(&self.path, range)
+    }
+
+    /// Shortcut: let bindings whose pattern falls inside `scope`.
+    pub fn let_bindings_in(&self, scope: TextRange) -> Vec<LetBinding> {
+        self.semantics()
+            .map(|s| s.let_bindings_in(&self.path, scope))
+            .unwrap_or_default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +347,9 @@ impl FileContext {
 ///
 /// Only simple identifier patterns are captured (`let [mut] name [: T] = …`).
 /// Destructuring patterns are skipped.
+///
+/// **Serde note:** `inferred_type` is skipped during serialization.
+/// Call `.ty()` before serializing if you need the inferred type in output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LetBinding {
     /// The bound variable name (e.g. `x` from `let x: f64 = 1.0`).
@@ -299,27 +359,35 @@ pub struct LetBinding {
     /// Example: `"f64"` from `let x: f64 = …`.
     pub explicit_type: Option<String>,
 
-    /// The type inferred by the compiler, only present when there is no
-    /// explicit annotation. Populated by the Forgen runtime via rust-analyzer.
-    /// Example: `"f64"` from `let x = 1.0_f64`.
-    pub inferred_type: Option<String>,
-
     /// Byte range of the entire `let … ;` statement (including the semicolon).
     pub range: TextRange,
 
+    /// Byte range of the initializer expression (the RHS of `=`).
+    /// `None` for `let x: T;` declarations with no initializer.
+    pub initializer_range: Option<TextRange>,
+
     /// Whether the binding was declared `let mut`.
     pub is_mut: bool,
+
+    /// Type inferred by rust-analyzer. Only populated on demand via `.ty()`.
+    /// The closure captures the `SemanticHandle` and fires `infer_type_at`.
+    ///
+    /// Skipped during serialization — call `.ty()` first to materialize it.
+    #[serde(skip, default)]
+    pub inferred_type: LazyValue<Option<String>>,
 }
 
 impl LetBinding {
     /// Returns the effective type of this binding.
     ///
-    /// Prefers the explicit annotation; falls back to the inferred type.
-    /// Returns `None` only when neither is available (e.g. inference failed).
+    /// Prefers the explicit annotation (instant, no RA).
+    /// Falls back to lazy RA type inference for the initializer expression.
+    /// Returns `None` only when neither is available (e.g. inference failed,
+    /// or the binding has no initializer).
     pub fn ty(&self) -> Option<&str> {
         self.explicit_type
             .as_deref()
-            .or(self.inferred_type.as_deref())
+            .or_else(|| self.inferred_type.get().as_deref())
     }
 
     /// Returns `true` if this binding's effective type matches `ty`.

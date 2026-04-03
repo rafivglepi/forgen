@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Both `start` and `end` are byte offsets (not character indices).
 /// The range is half-open: `[start, end)`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TextRange {
     pub start: u32,
     pub end: u32,

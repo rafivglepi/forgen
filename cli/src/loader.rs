@@ -181,7 +181,7 @@ impl Plugin for PluginSuite {
 ///
 /// Returns `None` (without error) if the key is absent — meaning the user
 /// has not configured a plugin suite yet and only built-in plugins run.
-pub fn load_suite(meta: &cargo_metadata::Metadata) -> Option<Box<dyn Plugin>> {
+pub fn load_suite(meta: &cargo_metadata::Metadata, build: bool) -> Option<Box<dyn Plugin>> {
     // Explicit config takes priority.  If absent, fall back to auto-discovery:
     // a workspace member named "plugins" is treated as the plugin suite by
     // convention (no Cargo.toml entry required).
@@ -202,50 +202,52 @@ pub fn load_suite(meta: &cargo_metadata::Metadata) -> Option<Box<dyn Plugin>> {
     let workspace_root: &Path = meta.workspace_root.as_std_path();
     let target_dir: &Path = meta.target_directory.as_std_path();
 
-    println!("  🔨 Building plugin suite '{suite_name}'...");
-    let build_start = Instant::now();
+    if build {
+        println!("  🔨 Building plugin suite '{suite_name}'...");
+        let build_start = Instant::now();
 
-    // Build the plugin suite crate as a cdylib.
-    // We suppress output on the first attempt; if the build fails we re-run
-    // with inherited stdio so the user sees the compiler errors.
-    let silent_status = Command::new("cargo")
-        .args(["build", "--package", &suite_name])
-        .current_dir(workspace_root)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+        // Build the plugin suite crate as a cdylib.
+        // We suppress output on the first attempt; if the build fails we re-run
+        // with inherited stdio so the user sees the compiler errors.
+        let silent_status = Command::new("cargo")
+            .args(["build", "--release", "--package", &suite_name])
+            .current_dir(workspace_root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
 
-    match silent_status {
-        Ok(s) if s.success() => {
-            println!(
-                "  ⏱ plugin suite build finished in {:.2?}",
-                build_start.elapsed()
-            );
-        }
-        Ok(_) => {
-            eprintln!(
-                "  ⚠️  `cargo build --package {suite_name}` failed — \
+        match silent_status {
+            Ok(s) if s.success() => {
+                println!(
+                    "  ⏱ plugin suite build finished in {:.2?}",
+                    build_start.elapsed()
+                );
+            }
+            Ok(_) => {
+                eprintln!(
+                    "  ⚠️  `cargo build --package {suite_name}` failed — \
                  re-running with output:"
-            );
-            let _ = Command::new("cargo")
-                .args(["build", "--package", &suite_name])
-                .current_dir(workspace_root)
-                .status();
-            return None;
-        }
-        Err(e) => {
-            eprintln!("  ⚠️  Failed to invoke `cargo build`: {e}");
-            return None;
+                );
+                let _ = Command::new("cargo")
+                    .args(["build", "--release", "--package", &suite_name])
+                    .current_dir(workspace_root)
+                    .status();
+                return None;
+            }
+            Err(e) => {
+                eprintln!("  ⚠️  Failed to invoke `cargo build`: {e}");
+                return None;
+            }
         }
     }
 
-    // Locate the compiled dylib in target/debug/.
+    // Locate the compiled dylib in target/release/.
     let lib_stem = suite_name.replace('-', "_");
     let Some(dylib_path) = dylib_path_in_target(target_dir, &lib_stem) else {
         eprintln!(
             "  ⚠️  Build succeeded but no dylib found for '{suite_name}' in {}.\n  \
              Make sure your Cargo.toml has `crate-type = [\"cdylib\"]`.",
-            target_dir.join("debug").display()
+            target_dir.join("release").display()
         );
         return None;
     };
@@ -276,11 +278,11 @@ pub fn load_suite(meta: &cargo_metadata::Metadata) -> Option<Box<dyn Plugin>> {
 // ---------------------------------------------------------------------------
 
 /// Returns the expected on-disk path of the `cdylib` output for `lib_stem`
-/// (underscores, not hyphens) inside `<target_dir>/debug/`.
+/// (underscores, not hyphens) inside `<target_dir>/release/`.
 ///
 /// Returns `None` if the file does not yet exist.
 fn dylib_path_in_target(target_dir: &Path, lib_stem: &str) -> Option<PathBuf> {
-    let debug_dir = target_dir.join("debug");
+    let release_dir = target_dir.join("release");
 
     #[cfg(target_os = "windows")]
     let filename = format!("{lib_stem}.dll");
@@ -291,6 +293,6 @@ fn dylib_path_in_target(target_dir: &Path, lib_stem: &str) -> Option<PathBuf> {
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let filename = format!("lib{lib_stem}.so");
 
-    let path = debug_dir.join(filename);
+    let path = release_dir.join(filename);
     path.exists().then_some(path)
 }
