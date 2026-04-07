@@ -2,4 +2,7 @@
 **/*.lock
 **/.vscode
 **/.cursor
+**/.zed
+**/.kilo
+**/.windsurf
 .cursorrules

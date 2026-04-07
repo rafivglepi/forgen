@@ -16,28 +16,3 @@ The plugin-facing replacement API is still byte-range based while running inside
 | `api`   | Internal API + plugin API                                | `forgen-api`   |
 | `cli`   | Build tool that analyzes files and writes `.forgen` JSON | `cargo-forgen` |
 | `test`  | Test crate for plugins, the CLI, and macro application   |                |
-
-## Building
-
-You need to install `cargo-forgen` in your path to use it in tests or checks. For that, run `cargo install --path ./cli`. For running cargo commands inside the test folder, use the run scripts for each respective platform:
-
-```bash
-./run.bash check
-./run.bash build
-./run.bash test
-```
-
-## Roadmap
-
-- [x] Load workspace with rust-analyzer at runtime
-- [x] Type inference for local `let` bindings via `Semantics`
-- [x] Plugin trait + `FileContext` API (no ra*ap*\* exposure to plugins)
-- [x] Replacement format `{ range: { start, end }, text }`
-- [x] Hardcoded f64-logger plugin (explicit + inferred `f64` bindings)
-- [x] Idempotent insertions (re-running forgen is safe)
-- [ ] Watch mode re-applying plugins on file save and refreshing `target/.forgen`
-- [ ] Dylib plugin loading (plugins as `.dll` / `.so`)
-- [ ] `SyntaxNode`-compatible wrapper enum so plugins work without ra_ap_syntax
-- [ ] Plugin registry in `build.rs` / `forgen.toml`
-- [ ] `comptime!` macro with live type access (similar to Zig's comptime)
-- [ ] Stable ABI for `FileContext` and the plugin-facing byte-range `Replacement`
