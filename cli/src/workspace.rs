@@ -6,7 +6,12 @@ use ra_ap_load_cargo::{load_workspace_at, LoadCargoConfig, ProcMacroServerChoice
 use ra_ap_paths::AbsPathBuf;
 use ra_ap_project_model::{CargoConfig, RustLibSource};
 use ra_ap_vfs::{Change, Vfs, VfsPath};
-use std::{collections::HashMap, fs, path::PathBuf, time::Instant};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceLoadOptions {
@@ -156,37 +161,43 @@ pub fn apply_file_changes(
     vfs: &mut Vfs,
     changed_files: &[PathBuf],
 ) -> Result<()> {
+    let mut updates = Vec::with_capacity(changed_files.len());
+
     for file_path in changed_files {
-        // Resolve to an absolute path.  For deleted files `canonicalize()`
-        // fails, so we fall back to making it absolute via the current dir.
-        let abs_path = if file_path.exists() {
-            file_path.canonicalize()?
-        } else {
-            std::env::current_dir()?.join(file_path)
-        };
-
-        let vfs_path = VfsPath::from(
-            AbsPathBuf::try_from(
-                abs_path
-                    .to_str()
-                    .ok_or_else(|| anyhow::anyhow!("Path is not valid UTF-8"))?,
-            )
-            .map_err(|e| anyhow::anyhow!("Invalid path: {:?}", e))?,
-        );
-
-        // If the file still exists, update its contents; if it was deleted or
-        // moved away, pass `None` so the VFS removes it from the database.
+        let abs_path = resolve_abs_path(file_path)?;
         let contents = if file_path.exists() {
             Some(
                 fs::read_to_string(file_path)
-                    .with_context(|| format!("Failed to read file: {:?}", file_path))?
-                    .into_bytes(),
+                    .with_context(|| format!("Failed to read file: {:?}", file_path))?,
             )
         } else {
             None
         };
 
-        vfs.set_file_contents(vfs_path, contents);
+        updates.push((abs_path, contents));
+    }
+
+    apply_text_updates(host, vfs, &updates)
+}
+
+pub fn apply_text_updates(
+    host: &mut RootDatabase,
+    vfs: &mut Vfs,
+    updates: &[(PathBuf, Option<String>)],
+) -> Result<()> {
+    for (path, contents) in updates {
+        let vfs_path = VfsPath::from(
+            AbsPathBuf::try_from(
+                path.to_str()
+                    .ok_or_else(|| anyhow::anyhow!("Path is not valid UTF-8"))?,
+            )
+            .map_err(|e| anyhow::anyhow!("Invalid path: {:?}", e))?,
+        );
+
+        vfs.set_file_contents(
+            vfs_path,
+            contents.as_ref().map(|text| text.as_bytes().to_vec()),
+        );
     }
 
     let vfs_changes = vfs.take_changes();
@@ -211,6 +222,20 @@ pub fn apply_file_changes(
     }
 
     Ok(())
+}
+
+fn resolve_abs_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        if path.exists() {
+            Ok(path.canonicalize()?)
+        } else {
+            Ok(path.to_path_buf())
+        }
+    } else if path.exists() {
+        Ok(path.canonicalize()?)
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
 }
 
 pub fn file_id_to_path(

@@ -11,9 +11,9 @@ use forgen_api::{
     syntax::raw::{Child as SyntaxChild, RawNode, RawToken},
     syntax::SyntaxKind,
     Dependency, DependencySource, DirNode, EnumDef, FieldDef, FileContext as ApiFileContext,
-    FileRef, FnDef, FnParam, FsEntry, ImplDef, LazyValue, LetBinding, PackageManifest, Plugin,
-    SemanticHandle, StructDef, TextRange as ApiTextRange, VariantDef, WorkspaceContext,
-    WorkspaceManifest,
+    FileRef, FnDef, FnParam, FsEntry, ImplDef, LazyValue, LetBinding, PackageManifest,
+    SemanticHandle, StructDef, SuiteRuntime, TextRange as ApiTextRange, VariantDef,
+    WorkspaceContext, WorkspaceManifest,
 };
 use notify_debouncer_mini::{new_debouncer, notify::*};
 use ra_ap_hir::{attach_db_allow_change, Crate, Semantics};
@@ -24,9 +24,11 @@ use ra_ap_vfs::Vfs;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc::channel, Arc, OnceLock};
 use std::time::{Duration, Instant};
+
+const MAX_PLUGIN_PASSES: usize = 10;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -98,6 +100,7 @@ fn main() -> Result<()> {
 
     let metadata_start = Instant::now();
     let workspace_info = workspace::get_workspace_info(&manifest_path_abs)?;
+    replacements::clear_saved_replacements(&workspace_info.root)?;
     println!(
         "⏱ cargo metadata + workspace discovery took {:.2?}",
         metadata_start.elapsed()
@@ -136,11 +139,21 @@ fn main() -> Result<()> {
     )?;
     println!("⏱ workspace load took {:.2?}", load_start.elapsed());
 
+    let mut suite_runtime = SuiteRuntime::new();
+    println!("🎲 Suite runtime seed: {}", suite_runtime.seed());
+
     if args.watch {
         println!("👀 Watch mode enabled - monitoring for changes...\n");
         println!("Press Ctrl+C to stop\n");
 
-        run_plugins(&host, &vfs, &workspace_info, true, args.verbose)?;
+        run_plugins(
+            &mut host,
+            &mut vfs,
+            &workspace_info,
+            true,
+            args.verbose,
+            &mut suite_runtime,
+        )?;
 
         let (tx, rx) = channel();
         let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
@@ -209,8 +222,14 @@ fn main() -> Result<()> {
                         println!("🔄 File system change detected, re-running plugins...");
                         match workspace::apply_file_changes(&mut host, &mut vfs, &changed_files) {
                             Ok(_) => {
-                                match run_plugins(&host, &vfs, &workspace_info, false, args.verbose)
-                                {
+                                match run_plugins(
+                                    &mut host,
+                                    &mut vfs,
+                                    &workspace_info,
+                                    false,
+                                    args.verbose,
+                                    &mut suite_runtime,
+                                ) {
                                     Ok(_) => println!("✅ Done\n"),
                                     Err(e) => eprintln!("❌ Plugin error: {}\n", e),
                                 }
@@ -228,7 +247,14 @@ fn main() -> Result<()> {
         }
     } else {
         let run_start = Instant::now();
-        run_plugins(&host, &vfs, &workspace_info, true, args.verbose)?;
+        run_plugins(
+            &mut host,
+            &mut vfs,
+            &workspace_info,
+            true,
+            args.verbose,
+            &mut suite_runtime,
+        )?;
         println!("⏱ plugin run took {:.2?}", run_start.elapsed());
         println!("⏱ total CLI time {:.2?}", total_start.elapsed());
         println!("\n✨ Done!");
@@ -242,174 +268,106 @@ fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn run_plugins(
-    db: &RootDatabase,
-    vfs: &Vfs,
+    db: &mut RootDatabase,
+    vfs: &mut Vfs,
     workspace_info: &workspace::WorkspaceInfo,
     build: bool,
     verbose: bool,
+    suite_runtime: &mut SuiteRuntime,
 ) -> Result<()> {
     let run_start = Instant::now();
     let project_dir = &workspace_info.root;
     let cargo_meta = &workspace_info.cargo_metadata;
 
-    // Plugins come entirely from the plugin suite — no built-ins.
-    let mut plugins: Vec<Box<dyn Plugin>> = Vec::new();
+    replacements::clear_saved_replacements(project_dir)?;
 
     // Plugin suite: `[workspace.metadata.forgen] suite = "..."`
     let suite_start = Instant::now();
-    if let Some(suite) = loader::load_suite(cargo_meta, build) {
+    let suite = loader::load_suite(cargo_meta, build);
+    if suite.is_some() {
         println!();
-        plugins.push(suite);
     }
     println!("⏱ plugin suite load took {:.2?}", suite_start.elapsed());
 
-    // All HIR operations (Semantics, Crate::all, type inference via
-    // `CliOracle`) must run while the database is attached to the Salsa2
-    // thread-local. We extend the scope to cover the full plugin loop so that
-    // LazyValue closures captured by plugins remain valid.
-    let (workspace_ctx, replacements_by_path, total_changes) =
-        attach_db_allow_change(db, || -> Result<_> {
-            println!("  entering semantics init");
-            let sema = Semantics::new(db);
-            println!("  finished semantics init");
+    let Some(suite) = suite else {
+        let write_start = Instant::now();
+        let total_saved = replacements::write_final_file_replacements(project_dir, &[])?;
+        println!(
+            "⏱ replacement JSON write took {:.2?}",
+            write_start.elapsed()
+        );
 
-            // Enumerate source files via the crate graph.  This ensures every
-            // file is linked to an analyzed crate so type_of_expr() can resolve types.
-            let enumerate_start = Instant::now();
-            let mut seen: HashSet<FileId> = HashSet::new();
-            let mut file_queue: Vec<EditionedFileId> = Vec::new();
-            let root_norm = normalize_path_str(&project_dir.to_string_lossy());
-
-            let crate_all = Crate::all(db);
-
-            for krate in &crate_all {
-                if !krate.origin(db).is_local() {
-                    continue;
-                }
-                for file_id in db
-                    .source_root(db.file_source_root(krate.root_file(db)).source_root_id(db))
-                    .source_root(db)
-                    .iter()
-                {
-                    if seen.insert(file_id) {
-                        file_queue.push(EditionedFileId::new(db, file_id, krate.edition(db)));
-                    }
-                }
-            }
-
-            let valid_roots: Vec<String> = cargo_meta
-                .workspace_packages()
-                .into_iter()
-                .filter(|p| p.dependencies.iter().any(|d| d.name == "forgen"))
-                .map(|p| {
-                    let mut rp = normalize_path_str(&p.manifest_path.parent().unwrap().to_string());
-                    if !rp.ends_with('/') {
-                        rp.push('/');
-                    }
-                    rp
-                })
-                .collect();
-
-            // Pre-compute normalized paths once to avoid redundant VFS lookups
-            // during retain, sort, and dedup.
-            let path_cache: HashMap<FileId, Option<String>> = file_queue
-                .iter()
-                .map(|ef| {
-                    let fid = ef.file_id(db);
-                    let norm = workspace::file_id_to_path(vfs, fid, project_dir)
-                        .map(|p| normalize_path_str(&p.to_string_lossy()));
-                    (fid, norm)
-                })
-                .collect();
-
-            // Filter to only files inside valid project roots.
-            let mut local_vfs_file_count = 0usize;
-            let mut skipped_non_local_files = 0usize;
-            file_queue.retain(|ef| {
-                let fid = ef.file_id(db);
-                let Some(path_norm) = path_cache.get(&fid).and_then(|p| p.as_deref()) else {
-                    skipped_non_local_files += 1;
-                    return false;
-                };
-                if path_norm.starts_with(&root_norm) && path_norm.ends_with(".rs") {
-                    let is_valid = valid_roots.is_empty()
-                        || valid_roots
-                            .iter()
-                            .any(|r| path_norm.starts_with(r.as_str()));
-                    if is_valid {
-                        local_vfs_file_count += 1;
-                        true
-                    } else {
-                        skipped_non_local_files += 1;
-                        false
-                    }
-                } else {
-                    skipped_non_local_files += 1;
-                    false
-                }
-            });
-
-            // sort_by_cached_key computes each key exactly once (vs sort_by_key's O(n log n) recomputation).
-            file_queue.sort_by_cached_key(|ef| {
-                path_cache
-                    .get(&ef.file_id(db))
-                    .and_then(|p| p.clone())
-                    .unwrap_or_default()
-            });
-
-            // Deduplicate (module traversal can yield a file multiple times).
-            file_queue.dedup_by_key(|ef| ef.file_id(db));
-
+        println!();
+        if total_saved > 0 {
             println!(
-                "  crate-graph file enumeration took {:.2?} (local={}, skipped={})",
-                enumerate_start.elapsed(),
-                local_vfs_file_count,
-                skipped_non_local_files
+                "✅ Saved {} total replacement patch(es) to target/.forgen/",
+                total_saved
             );
+        } else {
+            println!("✅ No replacements generated");
+        }
 
-            println!(
-                "  Building workspace context from {} file(s)...",
-                file_queue.len()
-            );
+        println!("⏱ run_plugins total took {:.2?}", run_start.elapsed());
+        return Ok(());
+    };
 
-            let workspace_ctx_start = Instant::now();
-            let ctx = build_workspace_context(
-                &sema,
-                db,
-                vfs,
-                project_dir,
-                file_queue,
-                cargo_meta,
-                verbose,
-            )?;
-            println!(
-                "  workspace context build took {:.2?}",
-                workspace_ctx_start.elapsed()
-            );
+    let mut working_suite_runtime = suite_runtime.clone();
 
-            // ── Plugin execution (inside the attach_db scope) ─────────────────
-            println!("🧩 Running {} plugin(s)...\n", plugins.len());
-            let plugin_exec_start = Instant::now();
-            let mut replacements_by_path: HashMap<String, Vec<Replacement>> = HashMap::new();
-            let mut total_changes: usize = 0;
+    let file_queue = enumerate_workspace_file_queue(db, vfs, project_dir, cargo_meta)?;
+    let snapshots = snapshot_workspace_sources(db, vfs, project_dir, &file_queue)?;
+    let original_sources: HashMap<String, String> = snapshots
+        .iter()
+        .map(|snapshot| (snapshot.rel_path.clone(), snapshot.source.clone()))
+        .collect();
+    let mut file_models = replacements::build_file_models(&original_sources);
+    let abs_paths_by_rel: HashMap<String, PathBuf> = snapshots
+        .iter()
+        .map(|snapshot| (snapshot.rel_path.clone(), snapshot.abs_path.clone()))
+        .collect();
 
-            for plugin in &plugins {
-                let _plugin_start = Instant::now();
-                let file_replacements = plugin.run(&ctx);
+    let fixed_point_result = run_fixed_point_passes(
+        original_sources.clone(),
+        |pass, current_sources| {
+            println!("🧩 Pass {pass}/{MAX_PLUGIN_PASSES}");
+            apply_source_snapshot(db, vfs, &abs_paths_by_rel, current_sources, true)?;
 
-                let mut plugin_changes = 0usize;
+            let pass_start = Instant::now();
+            let pass_output = attach_db_allow_change(db, || -> Result<_> {
+                println!("  entering semantics init");
+                let sema = Semantics::new(db);
+                println!("  finished semantics init");
+
+                println!(
+                    "  Building workspace context from {} file(s)...",
+                    file_queue.len()
+                );
+
+                let workspace_ctx_start = Instant::now();
+                let ctx = build_workspace_context(
+                    &sema,
+                    db,
+                    vfs,
+                    project_dir,
+                    file_queue.clone(),
+                    cargo_meta,
+                    verbose,
+                )?;
+                println!(
+                    "  workspace context build took {:.2?}",
+                    workspace_ctx_start.elapsed()
+                );
+
+                let suite_exec_start = Instant::now();
+                let file_replacements = suite.run(&ctx, &mut working_suite_runtime);
+                let mut replacements_by_path: HashMap<String, Vec<Replacement>> = HashMap::new();
+                let mut generated_replacements = 0usize;
+
                 for fr in file_replacements {
                     if fr.replacements.is_empty() {
                         continue;
                     }
 
-                    println!(
-                        "  🧩 {} → {} replacement(s)",
-                        fr.path,
-                        fr.replacements.len(),
-                    );
-                    total_changes += fr.replacements.len();
-                    plugin_changes += fr.replacements.len();
+                    generated_replacements += fr.replacements.len();
                     replacements_by_path
                         .entry(fr.path)
                         .or_default()
@@ -417,21 +375,92 @@ fn run_plugins(
                 }
 
                 println!(
-                    "⏱ plugin suite execution took {:.2?} ({} replacement(s))",
-                    plugin_exec_start.elapsed(),
-                    plugin_changes
+                    "  suite execution took {:.2?} ({} replacement(s))",
+                    suite_exec_start.elapsed(),
+                    generated_replacements
+                );
+
+                Ok(PassOutput {
+                    replacements_by_path,
+                    generated_replacements,
+                })
+            })?;
+
+            let changed_paths = replacements::changed_paths_from_replacements(
+                current_sources,
+                &pass_output.replacements_by_path,
+            )?;
+            let mut changed_paths: Vec<_> = changed_paths.into_iter().collect();
+            changed_paths.sort();
+
+            if changed_paths.is_empty() {
+                println!(
+                    "  pass {pass} converged in {:.2?} ({} replacement(s), no source changes)",
+                    pass_start.elapsed(),
+                    pass_output.generated_replacements
+                );
+            } else {
+                for path in &changed_paths {
+                    let model = file_models
+                        .get_mut(path)
+                        .ok_or_else(|| anyhow::anyhow!("Missing file model for `{path}`"))?;
+                    let current_source = current_sources.get(path).ok_or_else(|| {
+                        anyhow::anyhow!("Missing current source snapshot for `{path}`")
+                    })?;
+                    let replacements = pass_output
+                        .replacements_by_path
+                        .get(path)
+                        .ok_or_else(|| anyhow::anyhow!("Missing replacements for `{path}`"))?;
+
+                    replacements::apply_replacements_to_file_model(
+                        model,
+                        current_source,
+                        replacements,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "Failed to record original-source replacements for `{path}` in pass {pass}"
+                        )
+                    })?;
+                }
+
+                let changed_files = replacements::collect_changed_files(&file_models)?;
+                let saved_count =
+                    replacements::replace_saved_replacements(project_dir, &changed_files)?;
+                println!(
+                    "  saved intermediate replacement JSON after pass {pass} ({} patch(es))",
+                    saved_count
+                );
+
+                println!(
+                    "  pass {pass} changed {} file(s) in {:.2?}: {}",
+                    changed_paths.len(),
+                    pass_start.elapsed(),
+                    changed_paths.join(", ")
                 );
             }
 
-            Ok((ctx, replacements_by_path, total_changes))
-        })?;
+            Ok(pass_output)
+        },
+    );
+
+    let restore_result =
+        apply_source_snapshot(db, vfs, &abs_paths_by_rel, &original_sources, false);
+
+    let fixed_point_result = match (fixed_point_result, restore_result) {
+        (Ok(result), Ok(())) => result,
+        (Err(err), Ok(())) => return Err(err),
+        (Ok(_), Err(err)) => return Err(err),
+        (Err(run_err), Err(restore_err)) => {
+            return Err(run_err.context(format!(
+                "Additionally failed to restore original workspace snapshot: {restore_err}"
+            )))
+        }
+    };
 
     let write_start = Instant::now();
-    let total_saved = replacements::write_saved_replacements(
-        project_dir,
-        workspace_ctx.files.as_slice(),
-        &replacements_by_path,
-    )?;
+    let changed_files = replacements::collect_changed_files(&file_models)?;
+    let total_saved = replacements::replace_saved_replacements(project_dir, &changed_files)?;
     println!(
         "⏱ replacement JSON write took {:.2?}",
         write_start.elapsed()
@@ -443,7 +472,7 @@ fn run_plugins(
             "✅ Saved {} total replacement patch(es) to target/.forgen/",
             total_saved
         );
-    } else if total_changes > 0 {
+    } else if fixed_point_result.total_generated_replacements > 0 {
         println!("✅ Replacements were generated, but all serialised patch sets were empty");
     } else {
         println!("✅ No replacements generated");
@@ -451,7 +480,263 @@ fn run_plugins(
 
     println!("⏱ run_plugins total took {:.2?}", run_start.elapsed());
 
+    *suite_runtime = working_suite_runtime;
+
     Ok(())
+}
+
+#[derive(Debug)]
+struct PassOutput {
+    replacements_by_path: HashMap<String, Vec<Replacement>>,
+    generated_replacements: usize,
+}
+
+#[derive(Debug)]
+struct FixedPointResult {
+    total_generated_replacements: usize,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceFileSnapshot {
+    rel_path: String,
+    abs_path: PathBuf,
+    source: String,
+}
+
+fn run_fixed_point_passes<F>(
+    initial_sources: HashMap<String, String>,
+    mut run_pass: F,
+) -> Result<FixedPointResult>
+where
+    F: FnMut(usize, &HashMap<String, String>) -> Result<PassOutput>,
+{
+    let mut current_sources = initial_sources;
+    let mut total_generated_replacements = 0usize;
+
+    for pass in 1..=MAX_PLUGIN_PASSES {
+        let pass_output = run_pass(pass, &current_sources)?;
+        total_generated_replacements += pass_output.generated_replacements;
+
+        let changed_paths = replacements::changed_paths_from_replacements(
+            &current_sources,
+            &pass_output.replacements_by_path,
+        )?;
+
+        if changed_paths.is_empty() {
+            return Ok(FixedPointResult {
+                total_generated_replacements,
+            });
+        }
+
+        let mut changed_paths: Vec<_> = changed_paths.into_iter().collect();
+        changed_paths.sort();
+
+        if pass == MAX_PLUGIN_PASSES {
+            anyhow::bail!(
+                "Plugin execution did not converge after {} passes; files still changing: {}",
+                MAX_PLUGIN_PASSES,
+                changed_paths.join(", ")
+            );
+        }
+
+        let mut next_sources = current_sources.clone();
+        for path in changed_paths {
+            let source = current_sources
+                .get(&path)
+                .ok_or_else(|| anyhow::anyhow!("Replacement references unknown file `{path}`"))?;
+            let replacements = pass_output
+                .replacements_by_path
+                .get(&path)
+                .ok_or_else(|| anyhow::anyhow!("Missing replacement set for `{path}`"))?;
+            let rewritten = replacements::apply_replacements_to_source(source, replacements)
+                .with_context(|| format!("Failed to rewrite `{path}` during pass {pass}"))?;
+            next_sources.insert(path, rewritten);
+        }
+        current_sources = next_sources;
+    }
+
+    unreachable!("fixed-point pass loop should either converge or bail")
+}
+
+fn enumerate_workspace_file_queue(
+    db: &RootDatabase,
+    vfs: &Vfs,
+    project_dir: &PathBuf,
+    cargo_meta: &cargo_metadata::Metadata,
+) -> Result<Vec<EditionedFileId>> {
+    let enumerate_start = Instant::now();
+    let mut seen: HashSet<FileId> = HashSet::new();
+    let mut file_queue: Vec<EditionedFileId> = Vec::new();
+    let root_norm = normalize_path_str(&project_dir.to_string_lossy());
+
+    let crate_all = Crate::all(db);
+    for krate in &crate_all {
+        if !krate.origin(db).is_local() {
+            continue;
+        }
+        for file_id in db
+            .source_root(db.file_source_root(krate.root_file(db)).source_root_id(db))
+            .source_root(db)
+            .iter()
+        {
+            if seen.insert(file_id) {
+                file_queue.push(EditionedFileId::new(db, file_id, krate.edition(db)));
+            }
+        }
+    }
+
+    let valid_roots: Vec<String> = cargo_meta
+        .workspace_packages()
+        .into_iter()
+        .filter(|p| p.dependencies.iter().any(|d| d.name == "forgen"))
+        .map(|p| {
+            let mut rp = normalize_path_str(&p.manifest_path.parent().unwrap().to_string());
+            if !rp.ends_with('/') {
+                rp.push('/');
+            }
+            rp
+        })
+        .collect();
+
+    let path_cache: HashMap<FileId, Option<String>> = file_queue
+        .iter()
+        .map(|ef| {
+            let fid = ef.file_id(db);
+            let norm = workspace::file_id_to_path(vfs, fid, project_dir)
+                .map(|p| normalize_path_str(&p.to_string_lossy()));
+            (fid, norm)
+        })
+        .collect();
+
+    let mut local_vfs_file_count = 0usize;
+    let mut skipped_non_local_files = 0usize;
+    file_queue.retain(|ef| {
+        let fid = ef.file_id(db);
+        let Some(path_norm) = path_cache.get(&fid).and_then(|p| p.as_deref()) else {
+            skipped_non_local_files += 1;
+            return false;
+        };
+
+        if path_norm.starts_with(&root_norm) && path_norm.ends_with(".rs") {
+            let is_valid = valid_roots.is_empty()
+                || valid_roots
+                    .iter()
+                    .any(|r| path_norm.starts_with(r.as_str()));
+            if is_valid {
+                local_vfs_file_count += 1;
+                true
+            } else {
+                skipped_non_local_files += 1;
+                false
+            }
+        } else {
+            skipped_non_local_files += 1;
+            false
+        }
+    });
+
+    file_queue.sort_by_cached_key(|ef| {
+        path_cache
+            .get(&ef.file_id(db))
+            .and_then(|p| p.clone())
+            .unwrap_or_default()
+    });
+    file_queue.dedup_by_key(|ef| ef.file_id(db));
+
+    println!(
+        "  crate-graph file enumeration took {:.2?} (local={}, skipped={})",
+        enumerate_start.elapsed(),
+        local_vfs_file_count,
+        skipped_non_local_files
+    );
+
+    Ok(file_queue)
+}
+
+fn snapshot_workspace_sources(
+    db: &RootDatabase,
+    vfs: &Vfs,
+    project_dir: &PathBuf,
+    file_queue: &[EditionedFileId],
+) -> Result<Vec<WorkspaceFileSnapshot>> {
+    let root_norm = normalize_path_str(&project_dir.to_string_lossy());
+    let mut snapshots = Vec::with_capacity(file_queue.len());
+
+    for editioned_id in file_queue {
+        let file_id = editioned_id.file_id(db);
+        let abs_path = workspace::file_id_to_path(vfs, file_id, project_dir)
+            .ok_or_else(|| anyhow::anyhow!("Could not resolve path for file id {:?}", file_id))?;
+        let rel_path = relative_workspace_path(&root_norm, &abs_path);
+        let source = SourceDatabase::file_text(db, file_id).text(db).to_string();
+        snapshots.push(WorkspaceFileSnapshot {
+            rel_path,
+            abs_path,
+            source,
+        });
+    }
+
+    snapshots.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    Ok(snapshots)
+}
+
+fn apply_source_snapshot(
+    db: &mut RootDatabase,
+    vfs: &mut Vfs,
+    abs_paths_by_rel: &HashMap<String, PathBuf>,
+    sources_by_rel: &HashMap<String, String>,
+    neutralize_forgen_attr: bool,
+) -> Result<()> {
+    let mut rel_paths: Vec<_> = abs_paths_by_rel.keys().cloned().collect();
+    rel_paths.sort();
+
+    let mut updates = Vec::with_capacity(rel_paths.len());
+    for rel_path in rel_paths {
+        let abs_path = abs_paths_by_rel
+            .get(&rel_path)
+            .ok_or_else(|| anyhow::anyhow!("Missing absolute path for `{rel_path}`"))?;
+        let source = sources_by_rel
+            .get(&rel_path)
+            .ok_or_else(|| anyhow::anyhow!("Missing source snapshot for `{rel_path}`"))?;
+        let source = if neutralize_forgen_attr {
+            neutralize_forgen_file_attr(source)
+        } else {
+            source.clone()
+        };
+        updates.push((abs_path.clone(), Some(source)));
+    }
+
+    workspace::apply_text_updates(db, vfs, &updates)
+}
+
+fn neutralize_forgen_file_attr(source: &str) -> String {
+    let needle = "#![forgen::file(";
+    let Some(attr_index) = source.find(needle) else {
+        return source.to_owned();
+    };
+
+    let line_start = source[..attr_index]
+        .rfind('\n')
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let line_end = source[attr_index..]
+        .find('\n')
+        .map(|offset| attr_index + offset)
+        .unwrap_or(source.len());
+
+    let mut out = source.as_bytes().to_vec();
+    for byte in &mut out[line_start..line_end] {
+        *byte = b' ';
+    }
+
+    String::from_utf8(out).expect("source text should remain valid UTF-8")
+}
+
+fn relative_workspace_path(root_norm: &str, abs_path: &Path) -> String {
+    let path_norm = normalize_path_str(&abs_path.to_string_lossy());
+    path_norm
+        .strip_prefix(root_norm)
+        .map(|s| s.trim_start_matches('/').to_owned())
+        .unwrap_or(path_norm)
 }
 
 // ---------------------------------------------------------------------------
@@ -668,6 +953,7 @@ fn build_workspace_context(
         let file_handle: SemanticHandle = Arc::clone(&oracle).into_handle();
 
         let source_runtime = runtime;
+        let generated_regions_runtime = runtime;
         let tree_runtime = runtime;
         let functions_runtime = runtime;
         let structs_runtime = runtime;
@@ -677,6 +963,9 @@ fn build_workspace_context(
         files.push(ApiFileContext::new(
             rel_path,
             LazyValue::new(move || source_runtime.source()),
+            LazyValue::new(move || {
+                forgen_api::parse_generated_regions(&generated_regions_runtime.source())
+            }),
             LazyValue::new(move || tree_runtime.tree()),
             LazyValue::from_value(let_bindings),
             LazyValue::new(move || functions_runtime.functions()),

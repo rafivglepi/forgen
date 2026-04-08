@@ -6,14 +6,15 @@
 
 mod plugins;
 
-use forgen_api::{plugin_suite, FileReplacement, Plugin, WorkspaceContext};
+use forgen_api::{plugin_suite, FileReplacement, SuiteRuntime, WorkspaceContext};
 
-fn run(ctx: &WorkspaceContext) -> Vec<FileReplacement> {
+fn run(ctx: &WorkspaceContext, runtime: &mut SuiteRuntime) -> Vec<FileReplacement> {
     let mut out = Vec::new();
 
     // Register plugins here — just regular Rust method calls, no FFI.
-    out.extend(plugins::example::ExamplePlugin.run(ctx));
-    out.extend(plugins::f64_logger::F64LoggerPlugin.run(ctx));
+    out.extend(runtime.run_plugin(&plugins::example::ExamplePlugin, ctx));
+    out.extend(runtime.run_plugin(&plugins::seeded_binding::SeededBindingPlugin, ctx));
+    out.extend(runtime.run_plugin(&plugins::f64_logger::F64LoggerPlugin, ctx));
 
     out
 }

@@ -1,4 +1,4 @@
-use forgen_api::{FileReplacement, Plugin, Replacement, WorkspaceContext};
+use forgen_api::{FileReplacement, Plugin, PluginRuntime, Replacement, WorkspaceContext};
 
 /// Inserts a `println!` trace line after every `let` binding whose type is
 /// `f64`, whether the annotation is written explicitly (`let x: f64 = …`)
@@ -14,26 +14,21 @@ impl Plugin for F64LoggerPlugin {
         "f64-logger"
     }
 
-    fn run(&self, ctx: &WorkspaceContext) -> Vec<FileReplacement> {
+    fn run(&self, ctx: &WorkspaceContext, runtime: &mut PluginRuntime<'_>) -> Vec<FileReplacement> {
         let mut results = Vec::new();
 
         for file in &ctx.files {
             let mut replacements = Vec::new();
 
             for binding in file.bindings_of_type("f64") {
-                // Insertion point: right after the closing `;` of the statement.
-                let insert_at = binding.range.end;
-
-                // Replicate the indentation of the line that contains the `let`.
-                let indent = leading_indent(file.source(), insert_at);
+                if already_logged(file, runtime.plugin_id(), &binding.name) {
+                    continue;
+                }
 
                 replacements.push(Replacement::insert(
-                    insert_at,
-                    format!(
-                        "\n{indent}println!(\"{name}: {{}}\", {name});",
-                        indent = indent,
-                        name = binding.name,
-                    ),
+                    // Insertion point: right after the closing `;` of the statement.
+                    binding.range.end,
+                    format!("println!(\"{name}: {{}}\", {name});", name = binding.name,),
                 ));
             }
 
@@ -46,14 +41,13 @@ impl Plugin for F64LoggerPlugin {
     }
 }
 
-/// Returns the leading whitespace (spaces and tabs) of the line that contains
-/// `offset` (a byte offset into `source`).
-fn leading_indent(source: &str, offset: u32) -> String {
-    let up_to = (offset as usize).min(source.len());
-    let line_start = source[..up_to].rfind('\n').map(|i| i + 1).unwrap_or(0);
-
-    source[line_start..]
-        .chars()
-        .take_while(|c| *c == ' ' || *c == '\t')
-        .collect()
+fn already_logged(file: &forgen_api::FileContext, plugin_id: &str, binding_name: &str) -> bool {
+    file.generated_regions_for(plugin_id).any(|region| {
+        let start = region.inner_range.start as usize;
+        let end = region.inner_range.end as usize;
+        file.source()
+            .get(start..end)
+            .map(|text| text.contains(&format!("\"{binding_name}: {{}}\"")))
+            .unwrap_or(false)
+    })
 }

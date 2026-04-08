@@ -47,7 +47,10 @@ impl Replacement {
     /// is inserted at that position.
     pub fn insert(offset: u32, text: String) -> Self {
         Self {
-            range: TextRange { start: offset, end: offset },
+            range: TextRange {
+                start: offset,
+                end: offset,
+            },
             text,
         }
     }

@@ -3,8 +3,8 @@ use forgen_api::{
     LazyValue, LetBinding, TextRange,
 };
 use ra_ap_hir::{DisplayTarget, HirDisplay, Semantics};
-use ra_ap_ide_db::RootDatabase;
 use ra_ap_ide_db::EditionedFileId;
+use ra_ap_ide_db::RootDatabase;
 use ra_ap_syntax::{ast, ast::AstNode, ast::HasName};
 use ra_ap_vfs::Vfs;
 use std::collections::HashMap;
@@ -50,10 +50,9 @@ impl CliOracle {
 
         match q {
             SemanticQuery::InferTypeAt { file, range } => {
-                let result = self
-                    .file_map
-                    .get(&file)
-                    .and_then(|&eid| infer_type_at_range(&sema, db, eid, range, &file, self.verbose));
+                let result = self.file_map.get(&file).and_then(|&eid| {
+                    infer_type_at_range(&sema, db, eid, range, &file, self.verbose)
+                });
                 SemanticResult::InferredType(result)
             }
 
@@ -105,7 +104,8 @@ impl CliOracle {
                 let inferred_type = if b.explicit_type.is_some() {
                     LazyValue::from_value(None)
                 } else if let Some(init_range) = b.initializer_range {
-                    let ty = infer_type_at_range(sema, db, eid, init_range, file_path, self.verbose);
+                    let ty =
+                        infer_type_at_range(sema, db, eid, init_range, file_path, self.verbose);
                     LazyValue::from_value(ty)
                 } else {
                     LazyValue::from_value(None)
@@ -169,10 +169,7 @@ pub(crate) fn infer_type_at_range(
             let scope = sema.scope(let_stmt.syntax())?;
             let ty_str = type_info
                 .original
-                .display(
-                    db,
-                    DisplayTarget::from_crate(db, scope.krate().into()),
-                )
+                .display(db, DisplayTarget::from_crate(db, scope.krate().into()))
                 .to_string();
 
             if verbose {

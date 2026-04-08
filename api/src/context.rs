@@ -1,4 +1,5 @@
 use crate::query::SemanticHandle;
+use crate::runtime::{parse_generated_regions, GeneratedRegion};
 use crate::syntax::raw::RawNode;
 use crate::TextRange;
 use crate::{manifest::WorkspaceManifest, tree::DirNode};
@@ -92,10 +93,10 @@ impl<T: fmt::Debug> fmt::Debug for LazyValue<T> {
     }
 }
 
-/// The entire workspace handed to every plugin in one shot.
+/// The entire workspace snapshot handed to every plugin in one shot.
 ///
 /// Rather than calling plugins once per file, Forgen builds a complete picture
-/// of the workspace and passes it here. Plugins are therefore free to
+/// of the workspace for the current runner pass and passes it here. Plugins are therefore free to
 /// cross-reference files (e.g. "insert a log line in `a.rs` only if `b.rs`
 /// defines a certain type") without any extra plumbing.
 ///
@@ -169,7 +170,7 @@ impl WorkspaceContext {
     }
 }
 
-/// Information about a single Rust source file.
+/// Information about a single Rust source file in the current runner pass.
 ///
 /// The file identity (`path`) is always cheap and eager. Expensive derived data
 /// such as the CST, symbol lists, and inferred `let` binding types may be
@@ -180,6 +181,7 @@ pub struct FileContext {
     pub path: String,
 
     source: LazyValue<String>,
+    generated_regions: LazyValue<Vec<GeneratedRegion>>,
     tree: LazyValue<RawNode>,
     /// Syntax pass only — each binding carries its own lazy `inferred_type`.
     let_bindings: LazyValue<Vec<LetBinding>>,
@@ -198,6 +200,7 @@ impl FileContext {
     pub fn new(
         path: String,
         source: LazyValue<String>,
+        generated_regions: LazyValue<Vec<GeneratedRegion>>,
         tree: LazyValue<RawNode>,
         let_bindings: LazyValue<Vec<LetBinding>>,
         functions: LazyValue<Vec<FnDef>>,
@@ -209,6 +212,7 @@ impl FileContext {
         Self {
             path,
             source,
+            generated_regions,
             tree,
             let_bindings,
             functions,
@@ -219,9 +223,27 @@ impl FileContext {
         }
     }
 
-    /// Raw UTF-8 source text exactly as it exists on disk.
+    /// Raw UTF-8 source text for this file in the current runner pass.
+    ///
+    /// On the first pass this is the on-disk source. On later passes it may
+    /// include earlier plugin output wrapped in generated-region markers.
     pub fn source(&self) -> &str {
         self.source.get().as_str()
+    }
+
+    /// All generated regions currently present in `source()`.
+    pub fn generated_regions(&self) -> &[GeneratedRegion] {
+        self.generated_regions.get().as_slice()
+    }
+
+    /// Iterate over generated regions emitted by `plugin_id` in earlier passes.
+    pub fn generated_regions_for<'a>(
+        &'a self,
+        plugin_id: &'a str,
+    ) -> impl Iterator<Item = &'a GeneratedRegion> + 'a {
+        self.generated_regions()
+            .iter()
+            .filter(move |region| region.plugin_id == plugin_id)
     }
 
     /// The full CST of this file, with all trivia (whitespace, comments).
@@ -258,6 +280,11 @@ impl FileContext {
     /// Returns `true` if the file source has already been loaded.
     pub fn is_source_initialized(&self) -> bool {
         self.source.is_initialized()
+    }
+
+    /// Returns `true` if generated regions have already been parsed.
+    pub fn is_generated_regions_initialized(&self) -> bool {
+        self.generated_regions.is_initialized()
     }
 
     /// Returns `true` if the CST has already been built.
@@ -336,6 +363,12 @@ impl FileContext {
         self.semantics()
             .map(|s| s.let_bindings_in(&self.path, scope))
             .unwrap_or_default()
+    }
+}
+
+impl Default for LazyValue<Vec<GeneratedRegion>> {
+    fn default() -> Self {
+        LazyValue::from_value(parse_generated_regions(""))
     }
 }
 

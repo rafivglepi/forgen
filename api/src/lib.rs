@@ -16,7 +16,8 @@
 //! ```
 //!
 //! ```rust,no_run
-//! use forgen_api::{plugin_suite, FileReplacement, Plugin, Replacement, WorkspaceContext};
+//! use forgen_api::{plugin_suite, FileReplacement, Plugin, PluginRuntime, Replacement, SuiteRuntime, WorkspaceContext};
+//! use forgen_api::rand::Rng;
 //!
 //! #[derive(Default)]
 //! pub struct MyPlugin;
@@ -26,22 +27,40 @@
 //!         "my-plugin"
 //!     }
 //!
-//!     fn run(&self, ctx: &WorkspaceContext) -> Vec<FileReplacement> {
+//!     fn run(
+//!         &self,
+//!         ctx: &WorkspaceContext,
+//!         runtime: &mut PluginRuntime<'_>,
+//!     ) -> Vec<FileReplacement> {
 //!         let mut results = Vec::new();
 //!
 //!         for file in &ctx.files {
 //!             let mut replacements = Vec::new();
+//!             let mut rng = runtime.rng_for_file(&file.path);
 //!
 //!             for binding in file.bindings_of_type("f64") {
+//!                 if file.generated_regions_for(runtime.plugin_id()).any(|region| {
+//!                     let start = region.inner_range.start as usize;
+//!                     let end = region.inner_range.end as usize;
+//!                     file.source()
+//!                         .get(start..end)
+//!                         .map(|text| text.contains(&format!("{}:", binding.name)))
+//!                         .unwrap_or(false)
+//!                 }) {
+//!                     continue;
+//!                 }
+//!
 //!                 let insert_at = binding.range.end;
 //!                 let indent = leading_indent(file.source(), insert_at);
+//!                 let sample: u8 = rand::Rng::gen_range(&mut rng, 0..=9);
 //!
 //!                 replacements.push(Replacement::insert(
 //!                     insert_at,
 //!                     format!(
-//!                         "\n{indent}println!(\"{name}: {{}}\", {name});",
+//!                         "\n{indent}println!(\"{name} [{sample}]: {{}}\", {name});",
 //!                         indent = indent,
 //!                         name = binding.name,
+//!                         sample = sample,
 //!                     ),
 //!                 ));
 //!             }
@@ -65,8 +84,8 @@
 //!         .collect()
 //! }
 //!
-//! fn run(ctx: &WorkspaceContext) -> Vec<FileReplacement> {
-//!     MyPlugin.run(ctx)
+//! fn run(ctx: &WorkspaceContext, runtime: &mut SuiteRuntime) -> Vec<FileReplacement> {
+//!     runtime.run_plugin(&MyPlugin, ctx)
 //! }
 //!
 //! plugin_suite!(run);
@@ -77,6 +96,7 @@ pub mod manifest;
 mod plugin;
 pub mod query;
 mod replacement;
+mod runtime;
 pub mod syntax;
 pub mod tree;
 
@@ -87,9 +107,14 @@ pub use context::{
     EnumDef, FieldDef, FileContext, FnDef, FnParam, ImplDef, LazyValue, LetBinding, StructDef,
     VariantDef, WorkspaceContext,
 };
-pub use query::{SemanticHandle, SemanticQuery, SemanticResult};
 pub use manifest::{Dependency, DependencySource, PackageManifest, WorkspaceManifest};
 pub use plugin::Plugin;
+pub use query::{SemanticHandle, SemanticQuery, SemanticResult};
+pub use rand;
+pub use runtime::{
+    is_valid_plugin_id, parse_generated_regions, GeneratedRegion, PluginRuntime, PluginState,
+    SuiteRuntime,
+};
 
 /// Compile-time FNV-1a hash of a byte string.
 ///

@@ -15,7 +15,9 @@
 
 use forgen_api::syntax::raw::{Child, RawNode};
 use forgen_api::syntax::SyntaxKind;
-use forgen_api::{DirNode, FileReplacement, FsEntry, Plugin, TextRange, WorkspaceContext};
+use forgen_api::{
+    DirNode, FileReplacement, FsEntry, Plugin, PluginRuntime, TextRange, WorkspaceContext,
+};
 
 // ---------------------------------------------------------------------------
 // Plugin declaration
@@ -29,8 +31,12 @@ impl Plugin for ExamplePlugin {
         "example-plugin"
     }
 
-    fn run(&self, ctx: &WorkspaceContext) -> Vec<FileReplacement> {
-        let sep = "═".repeat(56);
+    fn run(
+        &self,
+        ctx: &WorkspaceContext,
+        _runtime: &mut PluginRuntime<'_>,
+    ) -> Vec<FileReplacement> {
+        let sep = "=".repeat(56);
         eprintln!("[example-plugin] {sep}");
         eprintln!("[example-plugin]  Workspace : {}", ctx.workspace_root);
 
@@ -115,13 +121,13 @@ fn print_dir_tree(dir: &DirNode, depth: usize) {
     } else {
         &dir.name
     };
-    eprintln!("[example-plugin]    {pad}📁 {display_name}/");
+    eprintln!("[example-plugin]    {pad}[dir] {display_name}/");
 
     for entry in &dir.entries {
         match entry {
             FsEntry::Dir(child) => print_dir_tree(child, depth + 1),
             FsEntry::File(f) => {
-                eprintln!("[example-plugin]    {pad}  📄 {}", f.name);
+                eprintln!("[example-plugin]    {pad}  [file] {}", f.name);
             }
         }
     }

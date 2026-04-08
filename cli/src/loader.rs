@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use forgen_api::{FileReplacement, Plugin, WorkspaceContext, FORGEN_ABI_VERSION};
+use forgen_api::{FileReplacement, SuiteRuntime, WorkspaceContext, FORGEN_ABI_VERSION};
 use libloading::{Library, Symbol};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,14 +14,15 @@ use std::time::Instant;
 // ---------------------------------------------------------------------------
 
 type ForgenAbiVersionFn = unsafe extern "C" fn() -> u64;
-type ForgenRunFn = unsafe extern "C" fn(*const WorkspaceContext) -> *mut Vec<FileReplacement>;
+type ForgenRunFn =
+    unsafe extern "C" fn(*const WorkspaceContext, *mut SuiteRuntime) -> *mut Vec<FileReplacement>;
 type ForgenFreeFn = unsafe extern "C" fn(*mut Vec<FileReplacement>);
 
 // ---------------------------------------------------------------------------
 // PluginSuite
 // ---------------------------------------------------------------------------
 
-/// A loaded plugin suite dylib, wrapped as a [`Plugin`].
+/// A loaded plugin suite dylib.
 ///
 /// The plugin suite is the **single** shared library that the CLI loads per
 /// workspace run.  Inside the dylib, plugin crates are called as plain Rust
@@ -144,20 +145,22 @@ impl PluginSuite {
     }
 }
 
-impl Plugin for PluginSuite {
-    fn name(&self) -> &str {
+impl PluginSuite {
+    pub fn name(&self) -> &str {
         &self.name
     }
 
-    fn run(&self, ctx: &WorkspaceContext) -> Vec<FileReplacement> {
+    pub fn run(&self, ctx: &WorkspaceContext, runtime: &mut SuiteRuntime) -> Vec<FileReplacement> {
         // Safety:
         // - `run_fn` is a valid function pointer; `_lib` is alive.
         // - `ctx` is a valid reference for the duration of this call.
+        // - `runtime` is a valid mutable reference for the duration of this call.
         // - The returned pointer was produced by `Box::into_raw` inside the
         //   dylib (via `plugin_suite!`).
         // - Both CLI and dylib use the system allocator, so
         //   `Box::from_raw` here correctly pairs with the dylib's `Box::new`.
-        let ptr = unsafe { (self.run_fn)(ctx as *const WorkspaceContext) };
+        let ptr =
+            unsafe { (self.run_fn)(ctx as *const WorkspaceContext, runtime as *mut SuiteRuntime) };
 
         if ptr.is_null() {
             return Vec::new();
@@ -181,7 +184,7 @@ impl Plugin for PluginSuite {
 ///
 /// Returns `None` (without error) if the key is absent — meaning the user
 /// has not configured a plugin suite yet and only built-in plugins run.
-pub fn load_suite(meta: &cargo_metadata::Metadata, build: bool) -> Option<Box<dyn Plugin>> {
+pub fn load_suite(meta: &cargo_metadata::Metadata, build: bool) -> Option<PluginSuite> {
     // Explicit config takes priority.  If absent, fall back to auto-discovery:
     // a workspace member named "plugins" is treated as the plugin suite by
     // convention (no Cargo.toml entry required).
@@ -264,7 +267,7 @@ pub fn load_suite(meta: &cargo_metadata::Metadata, build: bool) -> Option<Box<dy
                 "  ⏱ plugin suite dylib load took {:.2?}",
                 load_start.elapsed()
             );
-            Some(Box::new(p))
+            Some(p)
         }
         Err(e) => {
             eprintln!("  ⚠️  {e}");

@@ -1,4 +1,4 @@
-use crate::{FileReplacement, WorkspaceContext};
+use crate::{FileReplacement, PluginRuntime, WorkspaceContext};
 
 /// Implemented by every Forgen plugin.
 ///
@@ -10,44 +10,54 @@ use crate::{FileReplacement, WorkspaceContext};
 /// [`plugin_suite!`] to expose the single C entry-point that the
 /// Forgen CLI loads.
 pub trait Plugin: Send + Sync {
-    /// Human-readable name used in log output and error messages.
+    /// Stable plugin id used in log output, generated-region markers, seeded
+    /// RNG derivation, and plugin-local runtime state.
+    ///
+    /// The value must contain only ASCII letters, digits, `_`, or `-`.
     fn name(&self) -> &str;
 
-    /// Analyse the workspace and return any replacements to apply.
+    /// Analyse the workspace snapshot for the current pass and return any new
+    /// replacements to apply.
     ///
     /// # Contract
     ///
     /// - Receive the **entire workspace at once** — cross-file analysis is
     ///   fully supported.
+    /// - The workspace reflects the current fixed-point iteration, not
+    ///   necessarily the original on-disk source.
+    /// - Plugins must be idempotent: given the same workspace snapshot and
+    ///   plugin state, they must produce the same replacements.
+    /// - Plugins must not assume they run first or see raw source.
     /// - Return one [`FileReplacement`] per file that should be modified.
     ///   Files that need no changes should simply be omitted.
     /// - The runner applies replacements in **reverse offset order** so
     ///   plugins do not need to account for position shifts from earlier
     ///   insertions in the same file.
-    /// - Returning an empty `Vec` is valid and means "no changes".
-    fn run(&self, ctx: &WorkspaceContext) -> Vec<FileReplacement>;
+    /// - Returning an empty `Vec` is valid and means "nothing new to replace".
+    fn run(&self, ctx: &WorkspaceContext, runtime: &mut PluginRuntime<'_>) -> Vec<FileReplacement>;
 }
 
 /// Generates the three C-ABI entry points required for a Forgen suite
 /// `cdylib` crate.
 ///
 /// The single argument is any expression that, when called with
-/// `&WorkspaceContext`, returns `Vec<FileReplacement>`.  In practice this is
-/// either a plain function name or a closure that fans out to multiple plugin
-/// crates.
+/// `&WorkspaceContext` and `&mut SuiteRuntime`, returns `Vec<FileReplacement>`.
+/// In practice this is either a plain function name or a closure that fans out
+/// to multiple plugin crates via [`SuiteRuntime::run_plugin`].
 ///
 /// # Generated symbols
 ///
 /// | Symbol                | Signature                                                      |
 /// |-----------------------|----------------------------------------------------------------|
 /// | `forgen_abi_version`  | `extern "C" fn() -> u64`                                      |
-/// | `forgen_run`          | `unsafe extern "C" fn(*const WorkspaceContext) -> *mut Vec<FileReplacement>` |
+/// | `forgen_run`          | `unsafe extern "C" fn(*const WorkspaceContext, *mut SuiteRuntime) -> *mut Vec<FileReplacement>` |
 /// | `forgen_free`         | `unsafe extern "C" fn(*mut Vec<FileReplacement>)`             |
 ///
 /// `forgen_run` receives a raw pointer to the `WorkspaceContext` that lives
-/// on the CLI's stack and returns a `Box`-backed pointer to the result.  The
-/// CLI frees it with `Box::from_raw`; both sides must use the system
-/// allocator (no custom `#[global_allocator]`).
+/// on the CLI's stack plus a raw pointer to the in-memory [`SuiteRuntime`]
+/// owned by the CLI, and returns a `Box`-backed pointer to the result. The CLI
+/// frees it with `Box::from_raw`; both sides must use the system allocator
+/// (no custom `#[global_allocator]`).
 ///
 /// # Safety requirements
 ///
@@ -60,28 +70,28 @@ pub trait Plugin: Send + Sync {
 ///
 /// # Example
 ///
-/// ```rust,no_run
+/// ```rust,ignore
 /// // forgen-suite/src/lib.rs
-/// use forgen_api::{plugin_suite, FileReplacement, Plugin, WorkspaceContext};
+/// use forgen_api::{plugin_suite, FileReplacement, Plugin, SuiteRuntime, WorkspaceContext};
 /// use my_plugin::MyPlugin;
 /// use another_plugin::AnotherPlugin;
 ///
-/// plugin_suite!(|ctx: &WorkspaceContext| {
+/// plugin_suite!(|ctx: &WorkspaceContext, runtime: &mut SuiteRuntime| {
 ///     let mut out = Vec::new();
-///     out.extend(MyPlugin.run(ctx));
-///     out.extend(AnotherPlugin.run(ctx));
+///     out.extend(runtime.run_plugin(&MyPlugin, ctx));
+///     out.extend(runtime.run_plugin(&AnotherPlugin, ctx));
 ///     out
 /// });
 /// ```
 ///
 /// Or with a named function:
 ///
-/// ```rust,no_run
-/// use forgen_api::{plugin_suite, FileReplacement, Plugin, WorkspaceContext};
+/// ```rust,ignore
+/// use forgen_api::{plugin_suite, FileReplacement, Plugin, SuiteRuntime, WorkspaceContext};
 /// use my_plugin::MyPlugin;
 ///
-/// fn run(ctx: &WorkspaceContext) -> Vec<FileReplacement> {
-///     MyPlugin.run(ctx)
+/// fn run(ctx: &WorkspaceContext, runtime: &mut SuiteRuntime) -> Vec<FileReplacement> {
+///     runtime.run_plugin(&MyPlugin, ctx)
 /// }
 ///
 /// plugin_suite!(run);
@@ -110,11 +120,15 @@ macro_rules! plugin_suite {
         #[no_mangle]
         pub unsafe extern "C" fn forgen_run(
             __ctx: *const $crate::WorkspaceContext,
+            __runtime: *mut $crate::SuiteRuntime,
         ) -> *mut ::std::vec::Vec<$crate::FileReplacement> {
-            // Safety: the CLI guarantees __ctx is a valid reference for the
-            // duration of this call.
+            // Safety: the CLI guarantees __ctx is a valid reference and
+            // __runtime is a valid mutable reference for the duration of this
+            // call.
             let __ctx_ref: &$crate::WorkspaceContext = unsafe { &*__ctx };
-            let __result: ::std::vec::Vec<$crate::FileReplacement> = ($run_fn)(__ctx_ref);
+            let __runtime_ref: &mut $crate::SuiteRuntime = unsafe { &mut *__runtime };
+            let __result: ::std::vec::Vec<$crate::FileReplacement> =
+                ($run_fn)(__ctx_ref, __runtime_ref);
             ::std::boxed::Box::into_raw(::std::boxed::Box::new(__result))
         }
 

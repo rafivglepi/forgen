@@ -8,7 +8,6 @@ use std::sync::Arc;
 #[non_exhaustive]
 pub enum SemanticQuery {
     // ── File-scoped ──────────────────────────────────────────────────────
-
     /// All `let` bindings in the file, with `inferred_type` populated.
     /// (Prefer `file.let_bindings()` + `binding.ty()` for per-binding laziness.)
     LetBindings { file: String },
@@ -26,7 +25,6 @@ pub enum SemanticQuery {
     ResolveItemAt { file: String, range: TextRange },
 
     // ── Workspace-scoped ─────────────────────────────────────────────────
-
     /// All `impl` blocks across the workspace that implement `trait_path`.
     /// `trait_path` is matched by suffix (e.g. `"Display"` matches
     /// `std::fmt::Display`).
@@ -74,7 +72,9 @@ impl SemanticHandle {
     /// For maximum laziness, prefer `file.let_bindings()` + `binding.ty()`.
     /// This method runs inference for every unannotated binding up front.
     pub fn let_bindings(&self, file: &str) -> Vec<LetBinding> {
-        match self.query(SemanticQuery::LetBindings { file: file.to_owned() }) {
+        match self.query(SemanticQuery::LetBindings {
+            file: file.to_owned(),
+        }) {
             SemanticResult::LetBindings(v) => v,
             _ => vec![],
         }
@@ -93,7 +93,10 @@ impl SemanticHandle {
 
     /// Infer the type of the expression at `range`.
     pub fn infer_type_at(&self, file: &str, range: TextRange) -> Option<String> {
-        match self.query(SemanticQuery::InferTypeAt { file: file.to_owned(), range }) {
+        match self.query(SemanticQuery::InferTypeAt {
+            file: file.to_owned(),
+            range,
+        }) {
             SemanticResult::InferredType(t) => t,
             _ => None,
         }
@@ -101,7 +104,10 @@ impl SemanticHandle {
 
     /// Resolve the item at `range` to its fully-qualified path.
     pub fn resolve_item_at(&self, file: &str, range: TextRange) -> Option<String> {
-        match self.query(SemanticQuery::ResolveItemAt { file: file.to_owned(), range }) {
+        match self.query(SemanticQuery::ResolveItemAt {
+            file: file.to_owned(),
+            range,
+        }) {
             SemanticResult::ResolvedPath(p) => p,
             _ => None,
         }
